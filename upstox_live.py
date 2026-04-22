@@ -200,7 +200,7 @@ def inject_prz(chain_rows, expiry_date_str, step, spot_price):
 # ══════════════════════════════════════════════════════════
 API_KEY      = "3e51765a-3794-41ab-b3c9-4a88e0d55e30"
 API_SECRET   = "1ky9l299rf"
-REDIRECT_URI = "https://127.0.0.1/"
+REDIRECT_URI = "https://ioc-backend-kq9x.onrender.com/callback"
 # ══════════════════════════════════════════════════════════
 
 TOKEN_FILE = os.path.join(os.getcwd(), "upstox_token.json")
