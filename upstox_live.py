@@ -343,7 +343,7 @@ threading.Thread(target=background_market_recorder, daemon=True).start()
 # ══════════════════════════════════════════════════════════
 #  ROUTES
 # ══════════════════════════════════════════════════════════
-def load_mcx_options(symbol): return {"options": {}, "futures": {}} # Skeleton for space limits, add your MCX dict logic if needed
+def load_mcx_options(symbol): return {"options": {}, "futures": {}} # Skeleton for space limits
 
 def auth_headers(): return {"Authorization": f"Bearer {_access_token}", "Accept": "application/json"}
 
@@ -479,3 +479,11 @@ def callback_route():
     return f'<h2 style="color:red; font-family:sans-serif;">❌ Failed:</h2><p>{resp.text}</p>'
 
 load_saved_token()
+
+if __name__ == "__main__":
+    if API_KEY == "your_api_key_here":
+        print("WARNING: Add keys to upstox_live.py")
+        sys.exit(1)
+        
+    print("\n Server: http://127.0.0.1:5001\n" + "-" * 45)
+    app.run(port=5001, debug=False)
