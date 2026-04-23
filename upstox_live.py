@@ -367,8 +367,7 @@ def expiry_dates():
     data = resp.json().get("data") or []
     expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
     return jsonify({"symbol": symbol, "expiries": expiries})
-
-@app.route("/options-chain")
+# 🟢 1. ASK PYTHON FOR TODAY'S CSV DATA FROM 9:15 AM
 @app.route("/api/intraday-history")
 @require_firebase_auth
 def intraday_history():
@@ -419,6 +418,8 @@ def intraday_history():
         return jsonify(formatted_history)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/options-chain")
 def options_chain():
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
     expiry = request.args.get("expiry", "").strip()
