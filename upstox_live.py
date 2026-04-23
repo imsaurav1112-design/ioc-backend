@@ -369,6 +369,56 @@ def expiry_dates():
     return jsonify({"symbol": symbol, "expiries": expiries})
 
 @app.route("/options-chain")
+@app.route("/api/intraday-history")
+@require_firebase_auth
+def intraday_history():
+    symbol = request.args.get("symbol", "NIFTY").upper().strip()
+    expiry = request.args.get("expiry", "").strip()
+    filename = os.path.join(RECORDS_DIR, f"{symbol}_{expiry}_Recorded.csv")
+
+    if not os.path.exists(filename):
+        return jsonify([])
+
+    # We only want to load today's data into the live terminal
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    history_map = {}
+    base_oi = {}
+
+    try:
+        with open(filename, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                ts_str = row.get("Timestamp", "")
+                if not ts_str.startswith(today_str): continue
+
+                dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                time_key = dt.strftime("%I:%M %p")
+                strike = int(float(row.get("Strike", 0)))
+
+                ce_oi = int(float(row.get("CE_OI", 0)))
+                pe_oi = int(float(row.get("PE_OI", 0)))
+
+                # Track the first OI of the day to calculate real-time OI Change
+                if strike not in base_oi:
+                    base_oi[strike] = {"ce": ce_oi, "pe": pe_oi}
+
+                if time_key not in history_map:
+                    history_map[time_key] = []
+
+                history_map[time_key].append({
+                    "strike": strike,
+                    "ceVol": int(float(row.get("CE_Vol", 0))),
+                    "peVol": int(float(row.get("PE_Vol", 0))),
+                    "ceOI": ce_oi,
+                    "peOI": pe_oi,
+                    "ceOIChg": ce_oi - base_oi[strike]["ce"],
+                    "peOIChg": pe_oi - base_oi[strike]["pe"]
+                })
+
+        formatted_history = [{"time": k, "rows": v} for k, v in history_map.items()]
+        return jsonify(formatted_history)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 def options_chain():
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
     expiry = request.args.get("expiry", "").strip()
