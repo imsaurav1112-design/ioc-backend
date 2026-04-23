@@ -103,15 +103,12 @@ def inject_prz(chain_rows, expiry_date_str, step, spot_price):
         ce_ltp = float(r["ce"].get("ltp") or 0)
         pe_ltp = float(r["pe"].get("ltp") or 0)
         
-        # 🟢 COMMERCIAL FEATURE: Use Native Upstox IV & Greeks if available to avoid discrepancies.
-        native_ce_iv = float(r["ce"].get("iv") or 0) / 100.0
-        native_pe_iv = float(r["pe"].get("iv") or 0) / 100.0
+        raw_ce_iv = 0.15
+        raw_pe_iv = 0.15
         
-        raw_ce_iv = native_ce_iv
-        raw_pe_iv = native_pe_iv
-        
+        # 🟢 OVERRIDE UPSTOX: Force Custom Black-Scholes IV for EVERYTHING
         if spot_price and spot_price > 0:
-            if native_ce_iv <= 0 and ce_ltp > 0:
+            if ce_ltp > 0:
                 raw_ce_iv = calculate_custom_iv(ce_ltp, spot_price, strike, T, live_rate, 'ce')
                 ce_greeks = bs_greeks(spot_price, strike, T, live_rate, raw_ce_iv, 'ce')
                 r["ce"]["iv"] = round(raw_ce_iv * 100, 2)
@@ -119,8 +116,15 @@ def inject_prz(chain_rows, expiry_date_str, step, spot_price):
                 r["ce"]["theta"] = ce_greeks["theta"]
                 r["ce"]["vega"] = ce_greeks["vega"]
                 r["ce"]["gamma"] = ce_greeks["gamma"]
+            else:
+                # Failsafe for strikes with zero volume/LTP
+                r["ce"]["iv"] = 0
+                r["ce"]["delta"] = 0
+                r["ce"]["theta"] = 0
+                r["ce"]["vega"] = 0
+                r["ce"]["gamma"] = 0
                 
-            if native_pe_iv <= 0 and pe_ltp > 0:
+            if pe_ltp > 0:
                 raw_pe_iv = calculate_custom_iv(pe_ltp, spot_price, strike, T, live_rate, 'pe')
                 pe_greeks = bs_greeks(spot_price, strike, T, live_rate, raw_pe_iv, 'pe')
                 r["pe"]["iv"] = round(raw_pe_iv * 100, 2)
@@ -128,6 +132,12 @@ def inject_prz(chain_rows, expiry_date_str, step, spot_price):
                 r["pe"]["theta"] = pe_greeks["theta"]
                 r["pe"]["vega"] = pe_greeks["vega"]
                 r["pe"]["gamma"] = pe_greeks["gamma"]
+            else:
+                r["pe"]["iv"] = 0
+                r["pe"]["delta"] = 0
+                r["pe"]["theta"] = 0
+                r["pe"]["vega"] = 0
+                r["pe"]["gamma"] = 0
 
         iv_map[strike] = {"ce_iv": raw_ce_iv if raw_ce_iv > 0 else 0.15, "pe_iv": raw_pe_iv if raw_pe_iv > 0 else 0.15}
 
@@ -144,7 +154,6 @@ def inject_prz(chain_rows, expiry_date_str, step, spot_price):
         r["pe_prz"] = calc_prz(next_strike_down, ce_iv_down, strike, pe_iv, days_to_expiry, live_rate)
 
     return chain_rows
-
 # ══════════════════════════════════════════════════════════
 #  🔑  CONFIG
 # ══════════════════════════════════════════════════════════
