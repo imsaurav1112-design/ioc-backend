@@ -40,9 +40,7 @@ SYMBOL_MAP = {
     "BANKNIFTY":  {"instrument_key": "NSE_INDEX|Nifty Bank",          "lot": 30,  "step": 100},
     "FINNIFTY":   {"instrument_key": "NSE_INDEX|Nifty Fin Service",   "lot": 40,  "step": 50},
     "MIDCPNIFTY": {"instrument_key": "NSE_INDEX|Nifty Midcap Select", "lot": 50,  "step": 25},
-    "SENSEX":     {"instrument_key": "BSE_INDEX|SENSEX",              "lot": 20,  "step": 100},
-    "CRUDEOIL":   {"instrument_key": "", "lot": 100, "step": 10},
-    "NATURALGAS": {"instrument_key": "", "lot": 1250, "step": 5}, 
+    "SENSEX":     {"instrument_key": "BSE_INDEX|SENSEX",              "lot": 20,  "step": 100}, 
 }
 
 # 🟢 FIREBASE ADMIN SETUP
