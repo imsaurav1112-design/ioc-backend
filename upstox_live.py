@@ -1,15 +1,14 @@
 """
-InsiderOwl — Upstox Live Market Backend (Cloud Edition)
+InsiderOwl — Upstox Live Market Backend
 ====================================================================
-Includes 9:15-3:30 Automated Background Recorder (MongoDB Atlas).
-Prioritizes Native Upstox IV/Greeks for Indices to prevent discrepancies.
-Calculates EOR, EOS using the dual-rate Black-Scholes Engine.
-Stores Upstox Auth Token securely in the cloud to survive Render restarts.
+Includes 9:15-3:30 / 9:00-11:30 Automated Background Recorder (CSV Files).
+Bypasses Upstox MCX API limits with a custom option chain builder.
+No MongoDB. 100% Local File Storage.
 """
 
 import os, sys, time, json, requests, csv, threading, gzip, io
 from datetime import datetime, timedelta
-from urllib.parse import urlencode, quote_plus
+from urllib.parse import urlencode
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 import numpy as np
@@ -17,8 +16,6 @@ from scipy.stats import norm
 from scipy.optimize import brentq, fsolve
 from functools import wraps
 
-# 🟢 CLOUD IMPORTS
-from pymongo import MongoClient
 import firebase_admin
 from firebase_admin import credentials, auth
 
@@ -26,13 +23,17 @@ app = Flask(__name__)
 CORS(app)
 
 # ══════════════════════════════════════════════════════════
-#  🔑 CONFIGURATION & CLOUD SETUP
+#  🔑 CONFIGURATION
 # ══════════════════════════════════════════════════════════
 API_KEY      = "3e51765a-3794-41ab-b3c9-4a88e0d55e30"
 API_SECRET   = "1ky9l299rf"
 REDIRECT_URI = "https://ioc-backend-kq9x.onrender.com/callback"
 
-BASE_URL   = "https://api.upstox.com/v2"
+TOKEN_FILE   = os.path.join(os.getcwd(), "upstox_token.json")
+RECORDS_DIR  = os.path.join(os.getcwd(), "InsiderQuant_Records")
+os.makedirs(RECORDS_DIR, exist_ok=True)
+
+BASE_URL     = "https://api.upstox.com/v2"
 _access_token = None
 
 SYMBOL_MAP = {
@@ -41,9 +42,8 @@ SYMBOL_MAP = {
     "FINNIFTY":   {"instrument_key": "NSE_INDEX|Nifty Fin Service",   "lot": 40,  "step": 50},
     "MIDCPNIFTY": {"instrument_key": "NSE_INDEX|Nifty Midcap Select", "lot": 50,  "step": 25},
     "SENSEX":     {"instrument_key": "BSE_INDEX|SENSEX",              "lot": 20,  "step": 100},
-    
-    "CRUDEOIL":   {"instrument_key": "MCX_FO|CRUDEOIL", "lot": 100, "step": 10},
-    "NATURALGAS": {"instrument_key": "MCX_FO|NATURALGAS", "lot": 1250, "step": 5}, 
+    "CRUDEOIL":   {"instrument_key": "MCX_FO|CRUDEOIL",               "lot": 100, "step": 10},
+    "NATURALGAS": {"instrument_key": "MCX_FO|NATURALGAS",             "lot": 1250, "step": 5}, 
 }
 
 # 🟢 FIREBASE ADMIN SETUP
@@ -53,25 +53,8 @@ try:
 except Exception as e:
     print(f"⚠️ Firebase Admin Init Error (Auth will fail): {e}")
 
-# 🟢 MONGODB ATLAS SETUP
-# Step 1: Put your actual username and password inside the quotes below
-DB_USERNAME = quote_plus("insideowl")
-DB_PASSWORD = quote_plus("YOUR_ACTUAL_PASSWORD_HERE") # ⚠️ Paste your real password here
-
-# Step 2: Python will now safely build the connection string
-MONGO_URI = f"mongodb+srv://{DB_USERNAME}:{DB_PASSWORD}@ioc.ecqcgvo.mongodb.net/?appName=ioc"
-
-try:
-    mongo_client = MongoClient(MONGO_URI)
-    db = mongo_client["ioc_terminal"]
-    sys_col = db["system_config"]        # Tracks Upstox Token securely
-    history_col = db["intraday_history"] # Replaces CSVs for Options Chain Data
-    print("✅ Connected to MongoDB Atlas")
-except Exception as e:
-    print(f"❌ MongoDB Connection Error: {e}")
-
 # ══════════════════════════════════════════════════════════
-#  🛡️ SECURITY MIDDLEWARE (THE BOUNCER + CORS FIX)
+#  🛡️ SECURITY MIDDLEWARE
 # ══════════════════════════════════════════════════════════
 def require_firebase_auth(f):
     @wraps(f)
@@ -290,18 +273,20 @@ def calculate_coa(chain_rows, symbol, expiry):
     return {"scenario_id": scenario_id, "scenario_desc": scenario_desc, "support": sup, "resistance": res, "eos": eor_val, "eor": eos_val, "logs": mem['logs']}
 
 # ══════════════════════════════════════════════════════════
-#  🟢 CUSTOM MCX BUILDER (BYPASSES UPSTOX LIMIT)
+#  🟢 CUSTOM MCX CSV PARSER & BUILDER
 # ══════════════════════════════════════════════════════════
-def build_manual_mcx_chain(symbol, expiry):
-    """Downloads master instrument list and batch-fetches live quotes for MCX."""
-    cfg = SYMBOL_MAP.get(symbol)
+def get_mcx_csv_data():
+    """Helper to download and parse the raw MCX instrument file."""
     csv_url = "https://assets.upstox.com/market-quote/instruments/exchange/MCX_FO.csv.gz"
-    
+    r = requests.get(csv_url)
+    f = gzip.GzipFile(fileobj=io.BytesIO(r.content))
+    decoded_file = f.read().decode('utf-8').splitlines()
+    return list(csv.DictReader(decoded_file))
+
+def build_manual_mcx_chain(symbol, expiry):
+    """Bypasses the Upstox API limit by building the chain manually from the CSV."""
     try:
-        r = requests.get(csv_url)
-        f = gzip.GzipFile(fileobj=io.BytesIO(r.content))
-        decoded_file = f.read().decode('utf-8').splitlines()
-        reader = csv.DictReader(decoded_file)
+        reader = get_mcx_csv_data()
     except Exception as e:
         return {"error": f"Failed to download MCX instruments: {e}"}
 
@@ -309,21 +294,34 @@ def build_manual_mcx_chain(symbol, expiry):
     instrument_keys = []
     
     for row in reader:
-        if row['name'] == symbol and row['instrument_type'] in ['CE', 'PE']:
-            if row['expiry'] == expiry:
-                strike = float(row['strike'])
-                inst_key = row['instrument_key']
-                side = row['instrument_type'].lower()
-                
-                if strike not in strikes_map:
-                    strikes_map[strike] = {"strike": strike, "ce": None, "pe": None}
-                
-                strikes_map[strike][side] = inst_key
-                instrument_keys.append(inst_key)
+        # Match symbol and expiry
+        if row.get('name') == symbol and row.get('expiry') == expiry:
+            strike_str = row.get('strike', '0')
+            if not strike_str: continue
+            strike = float(strike_str)
+            if strike <= 0: continue
+
+            inst_key = row.get('instrument_key')
+            
+            # 🟢 FIX: Upstox puts CE/PE in the 'option_type' column for MCX, not instrument_type
+            side = row.get('option_type', '').lower()
+            if side not in ['ce', 'pe']:
+                side = row.get('instrument_type', '').lower()
+            if side not in ['ce', 'pe']:
+                if 'CE' in row.get('tradingsymbol', ''): side = 'ce'
+                elif 'PE' in row.get('tradingsymbol', ''): side = 'pe'
+                else: continue
+            
+            if strike not in strikes_map:
+                strikes_map[strike] = {"strike": strike, "ce": None, "pe": None}
+            
+            strikes_map[strike][side] = inst_key
+            instrument_keys.append(inst_key)
 
     if not instrument_keys:
-        return {"error": "No MCX contracts found for this expiry."}
+        return {"error": f"No MCX contracts found for {symbol} on {expiry}."}
 
+    # Batch Fetch Live Quotes
     live_data = {}
     chunk_size = 500
     for i in range(0, len(instrument_keys), chunk_size):
@@ -371,44 +369,61 @@ def build_manual_mcx_chain(symbol, expiry):
     return {"chain_rows": chain_rows, "total_ce_oi": total_ce_oi, "total_pe_oi": total_pe_oi}
 
 # ══════════════════════════════════════════════════════════
-#  🟢 AUTOMATED RECORDER (MONGODB)
+#  🟢 AUTOMATED RECORDER (CSV FILES)
 # ══════════════════════════════════════════════════════════
 def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
-    """Saves the snapshot directly to MongoDB Atlas"""
     if not chain_rows or not spot: return
     
+    filename = os.path.join(RECORDS_DIR, f"{symbol}_{expiry}_Recorded.csv")
+    file_exists = os.path.isfile(filename)
     ts = datetime.utcnow() + timedelta(hours=5, minutes=30)
     ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
-    date_str = ts.strftime("%Y-%m-%d")
-    time_key = ts.strftime("%I:%M %p")
 
     step = SYMBOL_MAP[symbol]["step"]
     atm = round(spot / step) * step
     compressed_chain = [r for r in chain_rows if abs(r['strike'] - atm) <= (15 * step)]
 
-    snapshot = {
-        "symbol": symbol,
-        "expiry": expiry,
-        "date": date_str,
-        "timestamp_str": ts_str,
-        "time_key": time_key,
-        "spot": spot,
-        "pcr": pcr,
-        "chain": compressed_chain
-    }
+    with open(filename, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow([
+                "Timestamp", "Symbol", "Expiry", "Spot", "PCR", "Strike", 
+                "CE_LTP", "CE_OI", "CE_Vol", "CE_IV", "CE_Delta", "CE_Theta", "CE_Vega", "CE_Gamma", 
+                "PE_LTP", "PE_OI", "PE_Vol", "PE_IV", "PE_Delta", "PE_Theta", "PE_Vega", "PE_Gamma"
+            ])
+        for r in compressed_chain:
+            writer.writerow([
+                ts_str, symbol, expiry, spot, pcr, r.get('strike'), 
+                r['ce'].get('ltp', 0), r['ce'].get('oi', 0), r['ce'].get('volume', 0), 
+                r['ce'].get('iv', 0), r['ce'].get('delta', 0), r['ce'].get('theta', 0), r['ce'].get('vega', 0), r['ce'].get('gamma', 0),
+                r['pe'].get('ltp', 0), r['pe'].get('oi', 0), r['pe'].get('volume', 0), 
+                r['pe'].get('iv', 0), r['pe'].get('delta', 0), r['pe'].get('theta', 0), r['pe'].get('vega', 0), r['pe'].get('gamma', 0)
+            ])
 
+def get_mcx_expiries(symbol):
+    """Extracts valid expiry dates directly from the MCX CSV."""
+    reader = get_mcx_csv_data()
+    expiries = set()
+    for row in reader:
+        if row.get('name') == symbol and float(row.get('strike', 0)) > 0:
+            expiries.add(row['expiry'])
     try:
-        history_col.insert_one(snapshot)
-    except Exception as e:
-        print(f"MongoDB Record Error: {e}")
+        return sorted(list(expiries), key=lambda d: datetime.strptime(d, "%Y-%m-%d"))
+    except:
+        return sorted(list(expiries))
 
 def fetch_and_record(symbol):
     cfg = SYMBOL_MAP.get(symbol)
     if not cfg: return
     
-    resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
-    data = resp.json().get("data") or []
-    expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
+    # 🟢 FIX: Route MCX Expiry checks to the manual CSV parser
+    if symbol in ["CRUDEOIL", "NATURALGAS"]:
+        expiries = get_mcx_expiries(symbol)
+    else:
+        resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
+        data = resp.json().get("data") or []
+        expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
+        
     if not expiries: return
     closest_expiry = expiries[0]
 
@@ -422,7 +437,6 @@ def fetch_and_record(symbol):
             
     if not spot: return
 
-    # 🟢 Divert to MCX Builder if needed
     if symbol in ["CRUDEOIL", "NATURALGAS"]:
         mcx_data = build_manual_mcx_chain(symbol, closest_expiry)
         if "error" in mcx_data: return
@@ -481,11 +495,11 @@ def background_market_recorder():
 
 threading.Thread(target=background_market_recorder, daemon=True).start()
 
+def auth_headers(): return {"Authorization": f"Bearer {_access_token}", "Accept": "application/json"}
+
 # ══════════════════════════════════════════════════════════
 #  🟢 TERMINAL DATA ROUTES
 # ══════════════════════════════════════════════════════════
-def auth_headers(): return {"Authorization": f"Bearer {_access_token}", "Accept": "application/json"}
-
 @app.route("/health")
 def health(): return jsonify({"status": "ok", "authenticated": _access_token is not None})
 
@@ -493,51 +507,63 @@ def health(): return jsonify({"status": "ok", "authenticated": _access_token is 
 @require_firebase_auth
 def expiry_dates():
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
-    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400 
+    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400
     
     cfg = SYMBOL_MAP.get(symbol)
-    resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
-    data = resp.json().get("data") or []
-    expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
-    return jsonify({"symbol": symbol, "expiries": expiries})
+    
+    # 🟢 FIX: Route MCX Expiry checks to the manual CSV parser
+    if symbol in ["CRUDEOIL", "NATURALGAS"]:
+        try:
+            expiries = get_mcx_expiries(symbol)
+            return jsonify({"symbol": symbol, "expiries": expiries})
+        except Exception as e:
+            return jsonify({"error": f"Failed to parse MCX expiries: {e}"}), 502
+    else:
+        resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
+        data = resp.json().get("data") or []
+        expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
+        return jsonify({"symbol": symbol, "expiries": expiries})
 
 @app.route("/api/intraday-history", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def intraday_history():
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
-    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400 
+    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400
     
     expiry = request.args.get("expiry", "").strip()
     target_date = request.args.get("date", datetime.now().strftime("%Y-%m-%d")).strip()
     
+    filename = os.path.join(RECORDS_DIR, f"{symbol}_{expiry}_Recorded.csv")
+    if not os.path.exists(filename):
+        return jsonify([])
+
+    history_map = {}
+    base_oi = {}
+
     try:
-        # 🟢 Query MongoDB
-        snapshots = list(history_col.find({
-            "symbol": symbol,
-            "expiry": expiry,
-            "date": target_date
-        }).sort("timestamp_str", 1))
+        with open(filename, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                ts_str = row.get("Timestamp", "")
+                if not ts_str.startswith(target_date): continue
 
-        if not snapshots: return jsonify([])
+                dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                time_key = dt.strftime("%I:%M %p")
+                strike = int(float(row.get("Strike", 0)))
 
-        history_map = {}
-        base_oi = {}
+                ce_oi = int(float(row.get("CE_OI", 0)))
+                pe_oi = int(float(row.get("PE_OI", 0)))
 
-        for snap in snapshots:
-            time_key = snap["time_key"]
-            if time_key not in history_map: history_map[time_key] = []
+                if strike not in base_oi:
+                    base_oi[strike] = {"ce": ce_oi, "pe": pe_oi}
 
-            for r in snap["chain"]:
-                strike = r.get("strike", 0)
-                ce_oi = r.get("ce", {}).get("oi", 0)
-                pe_oi = r.get("pe", {}).get("oi", 0)
-
-                if strike not in base_oi: base_oi[strike] = {"ce": ce_oi, "pe": pe_oi}
+                if time_key not in history_map:
+                    history_map[time_key] = []
 
                 history_map[time_key].append({
                     "strike": strike,
-                    "ceVol": r.get("ce", {}).get("volume", 0),
-                    "peVol": r.get("pe", {}).get("volume", 0),
+                    "ceVol": int(float(row.get("CE_Vol", 0))),
+                    "peVol": int(float(row.get("PE_Vol", 0))),
                     "ceOI": ce_oi,
                     "peOI": pe_oi,
                     "ceOIChg": ce_oi - base_oi[strike]["ce"],
@@ -546,16 +572,14 @@ def intraday_history():
 
         formatted_history = [{"time": k, "rows": v} for k, v in history_map.items()]
         return jsonify(formatted_history)
-
     except Exception as e:
-        print(f"MongoDB Fetch Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/options-chain", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def options_chain():
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
-    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400 
+    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400
     
     expiry = request.args.get("expiry", "").strip()
     cfg = SYMBOL_MAP.get(symbol)
@@ -568,8 +592,7 @@ def options_chain():
             break
 
     atm = round(float(spot) / cfg["step"]) * cfg["step"] if spot else None
-    
-    # 🟢 BRANCH A: The Manual MCX Route
+
     if symbol in ["CRUDEOIL", "NATURALGAS"]:
         mcx_data = build_manual_mcx_chain(symbol, expiry)
         if "error" in mcx_data:
@@ -583,14 +606,12 @@ def options_chain():
             for r in chain_rows:
                 r["atm"] = abs(r["strike"] - atm) < cfg["step"]
                 
-    # 🟢 BRANCH B: The Standard NSE/BSE Route
     else:
         resp = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": cfg["instrument_key"], "expiry_date": expiry}, headers=auth_headers())
         raw_list = resp.json().get("data") or []
         if not raw_list: return jsonify({"error": "No data from Upstox"}), 502
 
         chain_rows, total_ce_oi, total_pe_oi = [], 0, 0
-        
         for item in raw_list:
             strike = int(float(item.get("strike_price", 0)))
             if atm and abs(strike - atm) > 3000: continue
@@ -626,16 +647,28 @@ def options_chain():
         "chain": chain_rows, "fetched_at": datetime.now().strftime("%H:%M:%S"), "coa": coa_data
     })
 
+@app.route("/records", methods=['GET', 'OPTIONS'], strict_slashes=False)
+def list_records():
+    files = os.listdir(RECORDS_DIR) if os.path.exists(RECORDS_DIR) else []
+    html = '<h2 style="font-family:sans-serif;">Recorded Backtest Data</h2><ul>'
+    for f in sorted(files): html += f'<li><a href="/download/{f}">{f}</a></li>'
+    return html + '</ul>'
+
+@app.route("/download/<filename>", methods=['GET', 'OPTIONS'], strict_slashes=False)
+def download_record(filename):
+    file_path = os.path.join(RECORDS_DIR, filename)
+    if os.path.exists(file_path): return send_file(file_path, as_attachment=True)
+    return "File not found", 404
+
 # ══════════════════════════════════════════════════════════
-#  🟢 CLOUD AUTH FLOW (UPSTOX TO MONGODB)
+#  🟢 LOCAL AUTH FLOW (UPSTOX TOKEN.JSON)
 # ══════════════════════════════════════════════════════════
 def load_saved_token():
     global _access_token
     try:
-        token_doc = sys_col.find_one({"_id": "upstox_auth"})
-        if not token_doc: return False
-        
-        token = token_doc.get("access_token", "")
+        if not os.path.exists(TOKEN_FILE): return False
+        with open(TOKEN_FILE) as f: data = json.load(f)
+        token = data.get("access_token", "")
         if token:
             try:
                 import base64
@@ -647,7 +680,7 @@ def load_saved_token():
                     return True
             except: pass
             
-        if token_doc.get("date") != datetime.now().strftime("%Y-%m-%d"): return False
+        if data.get("date") != datetime.now().strftime("%Y-%m-%d"): return False
         _access_token = token
         return True
     except: return False
@@ -656,11 +689,8 @@ def save_token(token):
     global _access_token
     _access_token = token
     try:
-        sys_col.update_one(
-            {"_id": "upstox_auth"},
-            {"$set": {"access_token": token, "date": datetime.now().strftime("%Y-%m-%d")}},
-            upsert=True
-        )
+        with open(TOKEN_FILE, "w") as f:
+            json.dump({"access_token": token, "date": datetime.now().strftime("%Y-%m-%d")}, f)
     except: pass
 
 @app.route("/login")
@@ -679,13 +709,10 @@ def callback_route():
     )
     if resp.status_code == 200:
         save_token(resp.json().get("access_token"))
-        return '<h2 style="color:green; font-family:sans-serif;">✅ Login Successful! Token saved securely to MongoDB.</h2>'
+        return '<h2 style="color:green; font-family:sans-serif;">✅ Login Successful! Token saved locally.</h2>'
     return f'<h2 style="color:red; font-family:sans-serif;">❌ Failed:</h2><p>{resp.text}</p>'
 
 
-# ══════════════════════════════════════════════════════════
-#  SERVER START
-# ══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     if API_KEY == "your_api_key_here":
         print("WARNING: Add keys to upstox_live.py")
