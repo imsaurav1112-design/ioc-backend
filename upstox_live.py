@@ -442,6 +442,8 @@ def intraday_history():
                     "peOI": pe_oi,
                     "ceOIChg": ce_oi - base_oi[strike]["ce"],
                     "peOIChg": pe_oi - base_oi[strike]["pe"]
+                    "ceLTP": float(row.get("CE_LTP", 0)), 
+                    "peLTP": float(row.get("PE_LTP", 0))  
                 })
 
         formatted_history = [{"time": k, "rows": v} for k, v in history_map.items()]
