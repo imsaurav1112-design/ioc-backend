@@ -434,14 +434,14 @@ def intraday_history():
 
                 if strike not in base_oi: base_oi[strike] = {"ce": ce_oi, "pe": pe_oi}
 
-                history_map[time_key].append({
+               history_map[time_key].append({
                     "strike": strike,
-                    "ceVol": r.get("ce", {}).get("volume", 0),
-                    "peVol": r.get("pe", {}).get("volume", 0),
+                    "ceVol": int(float(row.get("CE_Vol", 0))),
+                    "peVol": int(float(row.get("PE_Vol", 0))),
                     "ceOI": ce_oi,
                     "peOI": pe_oi,
                     "ceOIChg": ce_oi - base_oi[strike]["ce"],
-                    "peOIChg": pe_oi - base_oi[strike]["pe"]
+                    "peOIChg": pe_oi - base_oi[strike]["pe"],
                     "ceLTP": float(row.get("CE_LTP", 0)), 
                     "peLTP": float(row.get("PE_LTP", 0))  
                 })
