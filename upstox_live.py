@@ -53,7 +53,15 @@ except Exception as e:
     print(f"⚠️ Firebase Admin Init Error (Auth will fail): {e}")
 
 # 🟢 MONGODB ATLAS SETUP
-MONGO_URI = "mongodb+srv://insideowl:<K@vy4120422>@ioc.ecqcgvo.mongodb.net/?appName=ioc"
+from urllib.parse import quote_plus
+
+# Step 1: Put your actual username and password inside the quotes below
+DB_USERNAME = quote_plus("insideowl")
+DB_PASSWORD = quote_plus("K@vy4120422") # ⚠️ Paste your real password here
+
+# Step 2: Python will now safely build the connection string
+MONGO_URI = f"mongodb+srv://{DB_USERNAME}:{DB_PASSWORD}@ioc.ecqcgvo.mongodb.net/?appName=ioc"
+
 try:
     mongo_client = MongoClient(MONGO_URI)
     db = mongo_client["ioc_terminal"]
