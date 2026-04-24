@@ -55,7 +55,7 @@ except Exception as e:
     print(f"⚠️ Firebase Admin Init Error (Auth will fail): {e}")
 
 # 🟢 MONGODB ATLAS SETUP (For Upstox Token Only)
-MONGO_URI = "mongodb+srv://insideowl:<db_password>@ioc.ecqcgvo.mongodb.net/?appName=ioc"
+MONGO_URI = "mongodb+srv://insideowl:<K@vy4120422>@ioc.ecqcgvo.mongodb.net/?appName=ioc"
 try:
     mongo_client = MongoClient(MONGO_URI)
     db = mongo_client["ioc_terminal"]
