@@ -6,17 +6,108 @@ Prioritizes Native Upstox IV/Greeks for Indices to prevent discrepancies.
 Calculates EOR, EOS using the dual-rate Black-Scholes Engine.
 """
 
-import os, sys, time, json, webbrowser, requests, gzip, io, csv, threading
+import os, sys, time, json, webbrowser, requests, threading
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 import numpy as np
 from scipy.stats import norm
 from scipy.optimize import brentq, fsolve
+from functools import wraps
+
+# 🟢 CLOUD & SAAS IMPORTS
+import 
+from pymongo import MongoClient
+import firebase_admin
+from firebase_admin import credentials, auth
 
 app = Flask(__name__)
 CORS(app)
+
+# ══════════════════════════════════════════════════════════
+#  🔑 CONFIGURATION & CLOUD SETUP
+# ══════════════════════════════════════════════════════════
+API_KEY      = "3e51765a-3794-41ab-b3c9-4a88e0d55e30"
+API_SECRET   = "1ky9l299rf"
+REDIRECT_URI = "https://ioc-backend-kq9x.onrender.com/callback"
+
+TOKEN_FILE = os.path.join(os.getcwd(), "upstox_token.json")
+BASE_URL   = "https://api.upstox.com/v2"
+_access_token = None
+
+SYMBOL_MAP = {
+    "NIFTY":      {"instrument_key": "NSE_INDEX|Nifty 50",            "lot": 75,  "step": 50},
+    "BANKNIFTY":  {"instrument_key": "NSE_INDEX|Nifty Bank",          "lot": 30,  "step": 100},
+    "FINNIFTY":   {"instrument_key": "NSE_INDEX|Nifty Fin Service",   "lot": 40,  "step": 50},
+    "MIDCPNIFTY": {"instrument_key": "NSE_INDEX|Nifty Midcap Select", "lot": 50,  "step": 25},
+    "SENSEX":     {"instrument_key": "BSE_INDEX|SENSEX",              "lot": 20,  "step": 100},
+    "CRUDEOIL":   {"instrument_key": "", "lot": 100, "step": 10},
+    "NATURALGAS": {"instrument_key": "", "lot": 1250, "step": 5}, 
+}
+
+# 🟢 FIREBASE ADMIN SETUP (For Security Bouncer)
+try:
+    # Ensure you download your service account JSON from Firebase!
+    cred = credentials.Certificate(os.path.join(os.getcwd(), 'firebase-admin.json'))
+    firebase_admin.initialize_app(cred)
+except Exception as e:
+    print(f"⚠️ Firebase Admin Init Error (Auth will fail): {e}")
+
+# 🟢 MONGODB ATLAS SETUP
+MONGO_URI = "mongodb+srv://insideowl:<db_password>@ioc.ecqcgvo.mongodb.net/?appName=ioc"
+try:
+    mongo_client = MongoClient(MONGO_URI)
+    db = mongo_client["ioc_terminal"]
+    users_col = db["subscriptions"]      # Tracks Users & Expiry
+    history_col = db["intraday_history"] # Tracks Options Chain Data
+    print("✅ Connected to MongoDB Atlas")
+except Exception as e:
+    print(f"❌ MongoDB Connection Error: {e}")
+
+# 🟢  SETUP
+_KEY_ID = "rzp_test_ShJD1Ns5T8Wsr1"
+RAZORPAY_KEY_SECRET = "UmqVvBGaSddU0W2LMCcsKYlk"
+rzp_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+
+PLANS = {
+    "1_month": {"price": 24900, "days": 30, "desc": "1 Month Pro Access"},
+    "3_month": {"price": 59900, "days": 90, "desc": "3 Month Pro Access"},
+    "6_month": {"price": 99900, "days": 180, "desc": "6 Month Pro Access"}
+}
+
+
+# ══════════════════════════════════════════════════════════
+#  🛡️ SECURITY MIDDLEWARE (THE BOUNCER)
+# ══════════════════════════════════════════════════════════
+def require_firebase_auth(f):
+    """Secures endpoints by verifying the frontend Firebase token."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        header = request.headers.get("Authorization")
+        if not header or not header.startswith("Bearer "):
+            return jsonify({"error": "Unauthorized Access"}), 401
+        
+        token = header.split(" ")[1]
+        try:
+            decoded_token = auth.verify_id_token(token)
+            request.user = decoded_token
+        except Exception as e:
+            return jsonify({"error": "Invalid or Expired Token", "details": str(e)}), 401
+            
+        return f(*args, **kwargs)
+    return decorated_function
+
+def verify_pro_status(uid):
+    """Checks MongoDB to ensure the user has an active, paid subscription."""
+    user = users_col.find_one({"uid": uid})
+    if not user or not user.get('pro'): return False
+    
+    expiry = user.get('expiry_date')
+    if not expiry or expiry < datetime.now(): return False
+    
+    return True
+
 
 # ══════════════════════════════════════════════════════════
 #  🟢 INSTITUTIONAL BLACK-SCHOLES SEESAW & GREEKS ENGINE
@@ -97,16 +188,13 @@ def inject_prz(chain_rows, expiry_date_str, step, spot_price):
         if live_rate < 0.05: live_rate = 0.0925 
 
     iv_map = {}
-    
     for r in chain_rows:
         strike = r["strike"]
         ce_ltp = float(r["ce"].get("ltp") or 0)
         pe_ltp = float(r["pe"].get("ltp") or 0)
-        
         raw_ce_iv = 0.15
         raw_pe_iv = 0.15
         
-        # 🟢 OVERRIDE UPSTOX: Force Custom Black-Scholes IV for EVERYTHING
         if spot_price and spot_price > 0:
             if ce_ltp > 0:
                 raw_ce_iv = calculate_custom_iv(ce_ltp, spot_price, strike, T, live_rate, 'ce')
@@ -117,12 +205,7 @@ def inject_prz(chain_rows, expiry_date_str, step, spot_price):
                 r["ce"]["vega"] = ce_greeks["vega"]
                 r["ce"]["gamma"] = ce_greeks["gamma"]
             else:
-                # Failsafe for strikes with zero volume/LTP
-                r["ce"]["iv"] = 0
-                r["ce"]["delta"] = 0
-                r["ce"]["theta"] = 0
-                r["ce"]["vega"] = 0
-                r["ce"]["gamma"] = 0
+                r["ce"]["iv"] = 0; r["ce"]["delta"] = 0; r["ce"]["theta"] = 0; r["ce"]["vega"] = 0; r["ce"]["gamma"] = 0
                 
             if pe_ltp > 0:
                 raw_pe_iv = calculate_custom_iv(pe_ltp, spot_price, strike, T, live_rate, 'pe')
@@ -133,11 +216,7 @@ def inject_prz(chain_rows, expiry_date_str, step, spot_price):
                 r["pe"]["vega"] = pe_greeks["vega"]
                 r["pe"]["gamma"] = pe_greeks["gamma"]
             else:
-                r["pe"]["iv"] = 0
-                r["pe"]["delta"] = 0
-                r["pe"]["theta"] = 0
-                r["pe"]["vega"] = 0
-                r["pe"]["gamma"] = 0
+                r["pe"]["iv"] = 0; r["pe"]["delta"] = 0; r["pe"]["theta"] = 0; r["pe"]["vega"] = 0; r["pe"]["gamma"] = 0
 
         iv_map[strike] = {"ce_iv": raw_ce_iv if raw_ce_iv > 0 else 0.15, "pe_iv": raw_pe_iv if raw_pe_iv > 0 else 0.15}
 
@@ -154,36 +233,9 @@ def inject_prz(chain_rows, expiry_date_str, step, spot_price):
         r["pe_prz"] = calc_prz(next_strike_down, ce_iv_down, strike, pe_iv, days_to_expiry, live_rate)
 
     return chain_rows
-# ══════════════════════════════════════════════════════════
-#  🔑  CONFIG
-# ══════════════════════════════════════════════════════════
-API_KEY      = "3e51765a-3794-41ab-b3c9-4a88e0d55e30"
-API_SECRET   = "1ky9l299rf"
-REDIRECT_URI = "https://ioc-backend-kq9x.onrender.com/callback"
-
-TOKEN_FILE = os.path.join(os.getcwd(), "upstox_token.json")
-MCX_TRACKER_FILE = os.path.join(os.getcwd(), "mcx_oi_tracker.json")
-RECORDS_DIR = os.path.join(os.getcwd(), "InsiderQuant_Records")
-os.makedirs(RECORDS_DIR, exist_ok=True)
-
-BASE_URL   = "https://api.upstox.com/v2"
-_access_token = None
-
-SYMBOL_MAP = {
-    "NIFTY":      {"instrument_key": "NSE_INDEX|Nifty 50",            "lot": 75,  "step": 50},
-    "BANKNIFTY":  {"instrument_key": "NSE_INDEX|Nifty Bank",          "lot": 30,  "step": 100},
-    "FINNIFTY":   {"instrument_key": "NSE_INDEX|Nifty Fin Service",   "lot": 40,  "step": 50},
-    "MIDCPNIFTY": {"instrument_key": "NSE_INDEX|Nifty Midcap Select", "lot": 50,  "step": 25},
-    "SENSEX":     {"instrument_key": "BSE_INDEX|SENSEX",              "lot": 20,  "step": 100},
-    "CRUDEOIL":   {"instrument_key": "", "lot": 100, "step": 10},
-    "NATURALGAS": {"instrument_key": "", "lot": 1250, "step": 5}, 
-}
-
-_cache = {}
-CACHE_TTL = 3
 
 # ══════════════════════════════════════════════════════════
-#  🟢 LTP CALCULATOR ENGINE
+#  🟢 LTP CALCULATOR ENGINE & COA LOGIC
 # ══════════════════════════════════════════════════════════
 COA_MEMORY = {}
 
@@ -249,38 +301,39 @@ def calculate_coa(chain_rows, symbol, expiry):
 
     return {"scenario_id": scenario_id, "scenario_desc": scenario_desc, "support": sup, "resistance": res, "eos": eor_val, "eor": eos_val, "logs": mem['logs']}
 
+
 # ══════════════════════════════════════════════════════════
-#  🟢 AUTOMATED 9:15 to 3:30 BACKGROUND RECORDER
+#  🟢 AUTOMATED 9:15 to 3:30 RECORDER (MONGODB UPDATE)
 # ══════════════════════════════════════════════════════════
 def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
+    """Saves the snapshot directly to MongoDB Atlas"""
     if not chain_rows or not spot: return
     
-    filename = os.path.join(RECORDS_DIR, f"{symbol}_{expiry}_Recorded.csv")
-    file_exists = os.path.isfile(filename)
     ts = datetime.utcnow() + timedelta(hours=5, minutes=30)
     ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
+    date_str = ts.strftime("%Y-%m-%d")
+    time_key = ts.strftime("%I:%M %p")
 
-    # High Compression: Only keep ATM +/- 15 strikes
+    # High Compression: Only keep ATM +/- 15 strikes for storage efficiency
     step = SYMBOL_MAP[symbol]["step"]
     atm = round(spot / step) * step
     compressed_chain = [r for r in chain_rows if abs(r['strike'] - atm) <= (15 * step)]
 
-    with open(filename, 'a', newline='') as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow([
-                "Timestamp", "Symbol", "Expiry", "Spot", "PCR", "Strike", 
-                "CE_LTP", "CE_OI", "CE_Vol", "CE_IV", "CE_Delta", "CE_Theta", "CE_Vega", "CE_Gamma", 
-                "PE_LTP", "PE_OI", "PE_Vol", "PE_IV", "PE_Delta", "PE_Theta", "PE_Vega", "PE_Gamma"
-            ])
-        for r in compressed_chain:
-            writer.writerow([
-                ts_str, symbol, expiry, spot, pcr, r.get('strike'), 
-                r['ce'].get('ltp', 0), r['ce'].get('oi', 0), r['ce'].get('volume', 0), 
-                r['ce'].get('iv', 0), r['ce'].get('delta', 0), r['ce'].get('theta', 0), r['ce'].get('vega', 0), r['ce'].get('gamma', 0),
-                r['pe'].get('ltp', 0), r['pe'].get('oi', 0), r['pe'].get('volume', 0), 
-                r['pe'].get('iv', 0), r['pe'].get('delta', 0), r['pe'].get('theta', 0), r['pe'].get('vega', 0), r['pe'].get('gamma', 0)
-            ])
+    snapshot = {
+        "symbol": symbol,
+        "expiry": expiry,
+        "date": date_str,
+        "timestamp_str": ts_str,
+        "time_key": time_key,
+        "spot": spot,
+        "pcr": pcr,
+        "chain": compressed_chain
+    }
+
+    try:
+        history_col.insert_one(snapshot)
+    except Exception as e:
+        print(f"MongoDB Record Error: {e}")
 
 def fetch_and_record(symbol):
     cfg = SYMBOL_MAP.get(symbol)
@@ -349,65 +402,131 @@ def background_market_recorder():
 # Start the background recorder
 threading.Thread(target=background_market_recorder, daemon=True).start()
 
-# ══════════════════════════════════════════════════════════
-#  ROUTES
-# ══════════════════════════════════════════════════════════
-def load_mcx_options(symbol): return {"options": {}, "futures": {}} # Skeleton for space limits
 
+# ══════════════════════════════════════════════════════════
+#  🟢 PAYMENT & SUBSCRIPTION ROUTES ()
+# ══════════════════════════════════════════════════════════
+@app.route('/api/create-subscription', methods=['POST'])
+@require_firebase_auth
+def create_subscription():
+    plan_id = request.json.get('plan_id')
+    if plan_id not in PLANS: return jsonify({"error": "Invalid Plan"}), 400
+    
+    order_data = {
+        "amount": PLANS[plan_id]["price"],
+        "currency": "INR",
+        "receipt": f"rcpt_{plan_id}_{request.user['uid'][:8]}",
+        "payment_capture": 1
+    }
+    order = rzp_client.order.create(data=order_data)
+    return jsonify(order)
+
+@app.route('/api/verify-payment', methods=['POST'])
+@require_firebase_auth
+def verify_payment():
+    data = request.json
+    plan_id = data.get('plan_id')
+    
+    try:
+        # 1. Verify  Signature
+        rzp_client.utility.verify_payment_signature({
+            '_order_id': data['_order_id'],
+            '_payment_id': data['_payment_id'],
+            '_signature': data['_signature']
+        })
+        
+        # 2. Check existing subscription in MongoDB
+        user_doc = users_col.find_one({"uid": request.user['uid']})
+        current_expiry = datetime.now()
+        
+        if user_doc and user_doc.get('expiry_date'):
+            if user_doc['expiry_date'] > datetime.now():
+                current_expiry = user_doc['expiry_date']
+        
+        # 3. Calculate new expiry
+        days_to_add = PLANS[plan_id]["days"]
+        new_expiry = current_expiry + timedelta(days=days_to_add)
+        
+        # 4. Save to MongoDB
+        users_col.update_one(
+            {"uid": request.user['uid']}, 
+            {"$set": {
+                "email": request.user['email'], 
+                "expiry_date": new_expiry, 
+                "plan": plan_id,
+                "pro": True
+            }}, 
+            upsert=True
+        )
+        
+        return jsonify({"status": "success", "new_expiry": new_expiry.strftime("%Y-%m-%d")})
+    except Exception as e:
+        return jsonify({"error": "Payment Verification Failed: " + str(e)}), 400
+
+
+# ══════════════════════════════════════════════════════════
+#  🟢 TERMINAL DATA ROUTES
+# ══════════════════════════════════════════════════════════
 def auth_headers(): return {"Authorization": f"Bearer {_access_token}", "Accept": "application/json"}
 
 @app.route("/health")
 def health(): return jsonify({"status": "ok", "authenticated": _access_token is not None})
 
 @app.route("/expiry-dates")
+@require_firebase_auth
 def expiry_dates():
+    # 🟢 BOUNCER Check
+    if not verify_pro_status(request.user['uid']): 
+        return jsonify({"error": "Subscription Required"}), 403
+
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
     cfg = SYMBOL_MAP.get(symbol)
     resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
     data = resp.json().get("data") or []
     expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
     return jsonify({"symbol": symbol, "expiries": expiries})
-# 🟢 1. ASK PYTHON FOR TODAY'S CSV DATA FROM 9:15 AM
+
 @app.route("/api/intraday-history")
 @require_firebase_auth
 def intraday_history():
+    # 🟢 BOUNCER Check
+    if not verify_pro_status(request.user['uid']): 
+        return jsonify({"error": "Subscription Required"}), 403
+
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
     expiry = request.args.get("expiry", "").strip()
-    filename = os.path.join(RECORDS_DIR, f"{symbol}_{expiry}_Recorded.csv")
-
-    if not os.path.exists(filename):
-        return jsonify([])
-
-    # We only want to load today's data into the live terminal
     today_str = datetime.now().strftime("%Y-%m-%d")
-    history_map = {}
-    base_oi = {}
 
     try:
-        with open(filename, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                ts_str = row.get("Timestamp", "")
-                if not ts_str.startswith(today_str): continue
+        # Query MongoDB for today's recorded snapshots
+        snapshots = list(history_col.find({
+            "symbol": symbol,
+            "expiry": expiry,
+            "date": today_str
+        }).sort("timestamp_str", 1))
 
-                dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                time_key = dt.strftime("%I:%M %p")
-                strike = int(float(row.get("Strike", 0)))
+        if not snapshots: return jsonify([])
 
-                ce_oi = int(float(row.get("CE_OI", 0)))
-                pe_oi = int(float(row.get("PE_OI", 0)))
+        history_map = {}
+        base_oi = {}
+
+        # Reformat MongoDB docs to match the Frontend Chart Engine logic
+        for snap in snapshots:
+            time_key = snap["time_key"]
+            if time_key not in history_map: history_map[time_key] = []
+
+            for r in snap["chain"]:
+                strike = r.get("strike", 0)
+                ce_oi = r.get("ce", {}).get("oi", 0)
+                pe_oi = r.get("pe", {}).get("oi", 0)
 
                 # Track the first OI of the day to calculate real-time OI Change
-                if strike not in base_oi:
-                    base_oi[strike] = {"ce": ce_oi, "pe": pe_oi}
-
-                if time_key not in history_map:
-                    history_map[time_key] = []
+                if strike not in base_oi: base_oi[strike] = {"ce": ce_oi, "pe": pe_oi}
 
                 history_map[time_key].append({
                     "strike": strike,
-                    "ceVol": int(float(row.get("CE_Vol", 0))),
-                    "peVol": int(float(row.get("PE_Vol", 0))),
+                    "ceVol": r.get("ce", {}).get("volume", 0),
+                    "peVol": r.get("pe", {}).get("volume", 0),
                     "ceOI": ce_oi,
                     "peOI": pe_oi,
                     "ceOIChg": ce_oi - base_oi[strike]["ce"],
@@ -416,11 +535,18 @@ def intraday_history():
 
         formatted_history = [{"time": k, "rows": v} for k, v in history_map.items()]
         return jsonify(formatted_history)
+
     except Exception as e:
+        print(f"MongoDB Fetch Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/options-chain")
+@require_firebase_auth
 def options_chain():
+    # 🟢 BOUNCER Check
+    if not verify_pro_status(request.user['uid']): 
+        return jsonify({"error": "Subscription Required"}), 403
+
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
     expiry = request.args.get("expiry", "").strip()
     cfg = SYMBOL_MAP.get(symbol)
@@ -441,7 +567,9 @@ def options_chain():
     
     for item in raw_list:
         strike = int(float(item.get("strike_price", 0)))
-        if atm and abs(strike - atm) > 1500: continue
+        
+        # 🟢 UPDATED: Expand strike limit from 1500 to 3000
+        if atm and abs(strike - atm) > 3000: continue
         
         def parse_side(d):
             if not d: return {"ltp": 0, "oi": 0, "change_oi": 0, "volume": 0, "iv": 0, "delta": 0, "theta": 0, "vega": 0, "gamma": 0}
@@ -473,22 +601,9 @@ def options_chain():
         "chain": chain_rows, "fetched_at": datetime.now().strftime("%H:%M:%S"), "coa": coa_data
     })
 
-# 🟢 NEW: ENDPOINT TO VIEW AND DOWNLOAD YOUR RECORDED FILES
-@app.route("/records")
-def list_records():
-    files = os.listdir(RECORDS_DIR) if os.path.exists(RECORDS_DIR) else []
-    html = '<h2 style="font-family:sans-serif;">Recorded Backtest Data</h2><ul>'
-    for f in sorted(files): html += f'<li><a href="/download/{f}">{f}</a></li>'
-    return html + '</ul>'
-
-@app.route("/download/<filename>")
-def download_record(filename):
-    file_path = os.path.join(RECORDS_DIR, filename)
-    if os.path.exists(file_path): return send_file(file_path, as_attachment=True)
-    return "File not found", 404
 
 # ══════════════════════════════════════════════════════════
-#  CLOUD AUTH FLOW 
+#  🟢 CLOUD AUTH FLOW (UPSTOX)
 # ══════════════════════════════════════════════════════════
 def load_saved_token():
     global _access_token
@@ -538,12 +653,15 @@ def callback_route():
         return '<h2 style="color:green; font-family:sans-serif;">✅ Login Successful! Token saved.</h2>'
     return f'<h2 style="color:red; font-family:sans-serif;">❌ Failed:</h2><p>{resp.text}</p>'
 
-load_saved_token()
 
+# ══════════════════════════════════════════════════════════
+#  SERVER START
+# ══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     if API_KEY == "your_api_key_here":
         print("WARNING: Add keys to upstox_live.py")
         sys.exit(1)
         
+    load_saved_token()
     print("\n Server: http://127.0.0.1:5001\n" + "-" * 45)
     app.run(port=5001, debug=False)
