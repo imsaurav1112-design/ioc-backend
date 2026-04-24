@@ -83,9 +83,13 @@ def require_firebase_auth(f):
     """Secures endpoints by verifying the frontend Firebase token."""
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        # 🟢 CORS FIX: Automatically allow browser preflight requests
+        # 🟢 CORS FIX: Explicitly handle the preflight with correct headers
         if request.method == "OPTIONS":
-            return jsonify({"status": "ok"}), 200
+            response = jsonify({"status": "ok"})
+            response.headers.add("Access-Control-Allow-Origin", "*")
+            response.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            response.headers.add("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            return response, 200
             
         header = request.headers.get("Authorization")
         if not header or not header.startswith("Bearer "):
@@ -100,7 +104,7 @@ def require_firebase_auth(f):
             
         return f(*args, **kwargs)
     return decorated_function
-
+    
 def verify_pro_status(uid):
     """Checks MongoDB to ensure the user has an active, paid subscription."""
     user = users_col.find_one({"uid": uid})
@@ -409,7 +413,7 @@ threading.Thread(target=background_market_recorder, daemon=True).start()
 # ══════════════════════════════════════════════════════════
 #  🟢 PAYMENT & SUBSCRIPTION ROUTES (RAZORPAY)
 # ══════════════════════════════════════════════════════════
-@app.route('/api/create-subscription', methods=['POST', 'OPTIONS'])
+@app.route('/api/create-subscription', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def create_subscription():
     plan_id = request.json.get('plan_id')
@@ -424,7 +428,7 @@ def create_subscription():
     order = rzp_client.order.create(data=order_data)
     return jsonify(order)
 
-@app.route('/api/verify-payment', methods=['POST', 'OPTIONS'])
+@app.route('/api/verify-payment', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def verify_payment():
     data = request.json
@@ -475,7 +479,7 @@ def auth_headers(): return {"Authorization": f"Bearer {_access_token}", "Accept"
 @app.route("/health")
 def health(): return jsonify({"status": "ok", "authenticated": _access_token is not None})
 
-@app.route("/expiry-dates", methods=['GET', 'OPTIONS'])
+@app.route("/expiry-dates", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def expiry_dates():
     # 🟢 BOUNCER Check
@@ -489,7 +493,7 @@ def expiry_dates():
     expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
     return jsonify({"symbol": symbol, "expiries": expiries})
 
-@app.route("/api/intraday-history", methods=['GET', 'OPTIONS'])
+@app.route("/api/intraday-history", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def intraday_history():
     # 🟢 BOUNCER Check
@@ -543,7 +547,7 @@ def intraday_history():
         print(f"MongoDB Fetch Error: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route("/options-chain", methods=['GET', 'OPTIONS'])
+@app.route("/options-chain", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def options_chain():
     # 🟢 BOUNCER Check
