@@ -4,6 +4,7 @@ InsiderOwl — Upstox Live Market Backend
 Includes 9:15-3:30 Automated Background Recorder (CSV Files).
 Prioritizes Native Upstox IV/Greeks for Indices to prevent discrepancies.
 Calculates EOR, EOS using the dual-rate Black-Scholes Engine.
+No MongoDB. 100% Local File Storage.
 """
 
 import os, sys, time, json, requests, csv, threading
@@ -378,7 +379,7 @@ def health(): return jsonify({"status": "ok", "authenticated": _access_token is 
 @require_firebase_auth
 def expiry_dates():
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
-    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400 # 🟢 Sanitization Fix
+    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400
     
     cfg = SYMBOL_MAP.get(symbol)
     resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
@@ -390,10 +391,9 @@ def expiry_dates():
 @require_firebase_auth
 def intraday_history():
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
-    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400 # 🟢 Sanitization Fix
+    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400
     
     expiry = request.args.get("expiry", "").strip()
-    # 🟢 Optional Date parameter for the backtester! If not provided, defaults to today.
     target_date = request.args.get("date", datetime.now().strftime("%Y-%m-%d")).strip()
     
     filename = os.path.join(RECORDS_DIR, f"{symbol}_{expiry}_Recorded.csv")
@@ -442,7 +442,7 @@ def intraday_history():
 @require_firebase_auth
 def options_chain():
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
-    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400 # 🟢 Sanitization Fix
+    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400
     
     expiry = request.args.get("expiry", "").strip()
     cfg = SYMBOL_MAP.get(symbol)
