@@ -7,9 +7,9 @@ Calculates EOR, EOS using the dual-rate Black-Scholes Engine.
 Stores Upstox Auth Token securely in the cloud to survive Render restarts.
 """
 
-import os, sys, time, json, requests, threading
+import os, sys, time, json, requests, csv, threading, gzip, io
 from datetime import datetime, timedelta
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote_plus
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 import numpy as np
@@ -54,11 +54,9 @@ except Exception as e:
     print(f"⚠️ Firebase Admin Init Error (Auth will fail): {e}")
 
 # 🟢 MONGODB ATLAS SETUP
-from urllib.parse import quote_plus
-
 # Step 1: Put your actual username and password inside the quotes below
 DB_USERNAME = quote_plus("insideowl")
-DB_PASSWORD = quote_plus("K@vy4120422") # ⚠️ Paste your real password here
+DB_PASSWORD = quote_plus("YOUR_ACTUAL_PASSWORD_HERE") # ⚠️ Paste your real password here
 
 # Step 2: Python will now safely build the connection string
 MONGO_URI = f"mongodb+srv://{DB_USERNAME}:{DB_PASSWORD}@ioc.ecqcgvo.mongodb.net/?appName=ioc"
@@ -292,10 +290,91 @@ def calculate_coa(chain_rows, symbol, expiry):
     return {"scenario_id": scenario_id, "scenario_desc": scenario_desc, "support": sup, "resistance": res, "eos": eor_val, "eor": eos_val, "logs": mem['logs']}
 
 # ══════════════════════════════════════════════════════════
-#  🟢 AUTOMATED 9:15 to 3:30 RECORDER (MONGODB)
+#  🟢 CUSTOM MCX BUILDER (BYPASSES UPSTOX LIMIT)
+# ══════════════════════════════════════════════════════════
+def build_manual_mcx_chain(symbol, expiry):
+    """Downloads master instrument list and batch-fetches live quotes for MCX."""
+    cfg = SYMBOL_MAP.get(symbol)
+    csv_url = "https://assets.upstox.com/market-quote/instruments/exchange/MCX_FO.csv.gz"
+    
+    try:
+        r = requests.get(csv_url)
+        f = gzip.GzipFile(fileobj=io.BytesIO(r.content))
+        decoded_file = f.read().decode('utf-8').splitlines()
+        reader = csv.DictReader(decoded_file)
+    except Exception as e:
+        return {"error": f"Failed to download MCX instruments: {e}"}
+
+    strikes_map = {}
+    instrument_keys = []
+    
+    for row in reader:
+        if row['name'] == symbol and row['instrument_type'] in ['CE', 'PE']:
+            if row['expiry'] == expiry:
+                strike = float(row['strike'])
+                inst_key = row['instrument_key']
+                side = row['instrument_type'].lower()
+                
+                if strike not in strikes_map:
+                    strikes_map[strike] = {"strike": strike, "ce": None, "pe": None}
+                
+                strikes_map[strike][side] = inst_key
+                instrument_keys.append(inst_key)
+
+    if not instrument_keys:
+        return {"error": "No MCX contracts found for this expiry."}
+
+    live_data = {}
+    chunk_size = 500
+    for i in range(0, len(instrument_keys), chunk_size):
+        chunk = instrument_keys[i:i + chunk_size]
+        keys_str = ",".join(chunk)
+        quote_resp = requests.get(f"{BASE_URL}/market-quote/quotes", params={"instrument_key": keys_str}, headers=auth_headers())
+        
+        if quote_resp.status_code == 200:
+            resp_data = quote_resp.json().get("data", {})
+            live_data.update(resp_data)
+
+    chain_rows = []
+    total_ce_oi, total_pe_oi = 0, 0
+    
+    for strike, data in strikes_map.items():
+        ce_key = data["ce"]
+        pe_key = data["pe"]
+        
+        def parse_quote(key):
+            q = live_data.get(key, {})
+            if not q: return {"ltp": 0, "oi": 0, "change_oi": 0, "volume": 0, "iv": 0, "delta": 0, "theta": 0, "vega": 0, "gamma": 0}
+            return {
+                "ltp": q.get("last_price", 0), 
+                "oi": int(q.get("oi", 0)), 
+                "change_oi": int(q.get("oi", 0)) - int(q.get("lower_circuit_limit", 0)), 
+                "volume": q.get("volume", 0), 
+                "iv": 0, "delta": 0, "theta": 0, "vega": 0, "gamma": 0 
+            }
+            
+        ce_data = parse_quote(ce_key)
+        pe_data = parse_quote(pe_key)
+        
+        total_ce_oi += ce_data["oi"]
+        total_pe_oi += pe_data["oi"]
+        
+        if ce_data["ltp"] > 0 or pe_data["ltp"] > 0:
+            chain_rows.append({
+                "strike": int(strike),
+                "atm": False, 
+                "ce": ce_data,
+                "pe": pe_data
+            })
+
+    chain_rows = sorted(chain_rows, key=lambda x: x["strike"])
+    return {"chain_rows": chain_rows, "total_ce_oi": total_ce_oi, "total_pe_oi": total_pe_oi}
+
+# ══════════════════════════════════════════════════════════
+#  🟢 AUTOMATED RECORDER (MONGODB)
 # ══════════════════════════════════════════════════════════
 def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
-    """Saves the snapshot directly to MongoDB Atlas instead of a CSV"""
+    """Saves the snapshot directly to MongoDB Atlas"""
     if not chain_rows or not spot: return
     
     ts = datetime.utcnow() + timedelta(hours=5, minutes=30)
@@ -341,28 +420,36 @@ def fetch_and_record(symbol):
             spot = v.get("last_price")
             break
             
-    chain_resp = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": cfg["instrument_key"], "expiry_date": closest_expiry}, headers=auth_headers())
-    raw_list = chain_resp.json().get("data") or []
-    if not raw_list: return
-    
-    if not spot: spot = float(raw_list[0].get("underlying_spot_price", 0))
+    if not spot: return
 
-    chain_rows, total_ce_oi, total_pe_oi = [], 0, 0
-    for item in raw_list:
-        strike = int(float(item.get("strike_price", 0)))
-        def p_side(d):
-            md, og = d.get("market_data") or {}, d.get("option_greeks") or {}
-            raw_iv = float(og.get("iv") or 0)
-            return {
-                "ltp": md.get("ltp", 0), "oi": md.get("oi", 0), "volume": md.get("volume", 0),
-                "iv": raw_iv * 100 if 0 < raw_iv < 1.0 else raw_iv, 
-                "delta": og.get("delta", 0), "theta": og.get("theta", 0), "vega": og.get("vega", 0), "gamma": float(og.get("gamma") or 0.0005) * 10000
-            }
-        ce, pe = p_side(item.get("call_options") or {}), p_side(item.get("put_options") or {})
-        total_ce_oi += ce["oi"]
-        total_pe_oi += pe["oi"]
-        chain_rows.append({"strike": strike, "ce": ce, "pe": pe})
+    # 🟢 Divert to MCX Builder if needed
+    if symbol in ["CRUDEOIL", "NATURALGAS"]:
+        mcx_data = build_manual_mcx_chain(symbol, closest_expiry)
+        if "error" in mcx_data: return
+        chain_rows = mcx_data["chain_rows"]
+        total_ce_oi = mcx_data["total_ce_oi"]
+        total_pe_oi = mcx_data["total_pe_oi"]
+    else:
+        chain_resp = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": cfg["instrument_key"], "expiry_date": closest_expiry}, headers=auth_headers())
+        raw_list = chain_resp.json().get("data") or []
+        if not raw_list: return
         
+        chain_rows, total_ce_oi, total_pe_oi = [], 0, 0
+        for item in raw_list:
+            strike = int(float(item.get("strike_price", 0)))
+            def p_side(d):
+                md, og = d.get("market_data") or {}, d.get("option_greeks") or {}
+                raw_iv = float(og.get("iv") or 0)
+                return {
+                    "ltp": md.get("ltp", 0), "oi": md.get("oi", 0), "volume": md.get("volume", 0),
+                    "iv": raw_iv * 100 if 0 < raw_iv < 1.0 else raw_iv, 
+                    "delta": og.get("delta", 0), "theta": og.get("theta", 0), "vega": og.get("vega", 0), "gamma": float(og.get("gamma") or 0.0005) * 10000
+                }
+            ce, pe = p_side(item.get("call_options") or {}), p_side(item.get("put_options") or {})
+            total_ce_oi += ce["oi"]
+            total_pe_oi += pe["oi"]
+            chain_rows.append({"strike": strike, "ce": ce, "pe": pe})
+            
     pcr = round(total_pe_oi / max(total_ce_oi, 1), 2)
     chain_rows = inject_prz(chain_rows, closest_expiry, cfg["step"], spot)
     compress_and_save(symbol, closest_expiry, spot, pcr, chain_rows)
@@ -382,7 +469,7 @@ def background_market_recorder():
         
         # 🟢 NSE & BSE TIMINGS: 9:15 AM to 3:30 PM
         if 915 <= time_int <= 1530:
-            for sym in ["NIFTY", "BANKNIFTY", "SENSEX"]: # 👈 Trimmed down to just these 3
+            for sym in ["NIFTY", "BANKNIFTY", "SENSEX"]:
                 try: fetch_and_record(sym)
                 except Exception as e: print(f"Recording Error for {sym}: {e}")
 
@@ -391,6 +478,8 @@ def background_market_recorder():
             for sym in ["CRUDEOIL", "NATURALGAS"]:
                 try: fetch_and_record(sym)
                 except Exception as e: print(f"Recording Error for {sym}: {e}")
+
+threading.Thread(target=background_market_recorder, daemon=True).start()
 
 # ══════════════════════════════════════════════════════════
 #  🟢 TERMINAL DATA ROUTES
@@ -422,7 +511,7 @@ def intraday_history():
     target_date = request.args.get("date", datetime.now().strftime("%Y-%m-%d")).strip()
     
     try:
-        # 🟢 Query MongoDB instead of searching for a CSV
+        # 🟢 Query MongoDB
         snapshots = list(history_col.find({
             "symbol": symbol,
             "expiry": expiry,
@@ -471,10 +560,6 @@ def options_chain():
     expiry = request.args.get("expiry", "").strip()
     cfg = SYMBOL_MAP.get(symbol)
 
-    resp = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": cfg["instrument_key"], "expiry_date": expiry}, headers=auth_headers())
-    raw_list = resp.json().get("data") or []
-    if not raw_list: return jsonify({"error": "No data from Upstox"}), 502
-
     spot_resp = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
     spot = None
     if spot_resp.status_code == 200:
@@ -483,38 +568,60 @@ def options_chain():
             break
 
     atm = round(float(spot) / cfg["step"]) * cfg["step"] if spot else None
-    chain_rows, total_ce_oi, total_pe_oi = [], 0, 0
     
-    for item in raw_list:
-        strike = int(float(item.get("strike_price", 0)))
-        if atm and abs(strike - atm) > 3000: continue
-        
-        def parse_side(d):
-            if not d: return {"ltp": 0, "oi": 0, "change_oi": 0, "volume": 0, "iv": 0, "delta": 0, "theta": 0, "vega": 0, "gamma": 0}
-            md, og = d.get("market_data") or {}, d.get("option_greeks") or {}
-            raw_iv = float(og.get("iv") or 0)
-            return {
-                "ltp": md.get("ltp"), "oi": int(md.get("oi") or 0), 
-                "change_oi": int(md.get("oi") or 0) - int(md.get("prev_oi") or 0),
-                "volume": md.get("volume", 0), 
-                "iv": round(raw_iv * 100, 2) if 0 < raw_iv < 1.0 else round(raw_iv, 2), 
-                "delta": round(float(og.get("delta") or 0), 4),
-                "theta": round(float(og.get("theta") or 0), 4), 
-                "vega": round(float(og.get("vega") or 0), 4), 
-                "gamma": round(float(og.get("gamma") or 0.0005) * 10000, 2)
-            }
+    # 🟢 BRANCH A: The Manual MCX Route
+    if symbol in ["CRUDEOIL", "NATURALGAS"]:
+        mcx_data = build_manual_mcx_chain(symbol, expiry)
+        if "error" in mcx_data:
+            return jsonify(mcx_data), 502
             
-        ce = parse_side(item.get("call_options"))
-        pe = parse_side(item.get("put_options"))
-        total_ce_oi += ce["oi"] or 0
-        total_pe_oi += pe["oi"] or 0
-        chain_rows.append({"strike": strike, "atm": atm is not None and abs(strike - atm) < cfg["step"], "ce": ce, "pe": pe})
+        chain_rows = mcx_data["chain_rows"]
+        total_ce_oi = mcx_data["total_ce_oi"]
+        total_pe_oi = mcx_data["total_pe_oi"]
+        
+        if atm:
+            for r in chain_rows:
+                r["atm"] = abs(r["strike"] - atm) < cfg["step"]
+                
+    # 🟢 BRANCH B: The Standard NSE/BSE Route
+    else:
+        resp = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": cfg["instrument_key"], "expiry_date": expiry}, headers=auth_headers())
+        raw_list = resp.json().get("data") or []
+        if not raw_list: return jsonify({"error": "No data from Upstox"}), 502
 
+        chain_rows, total_ce_oi, total_pe_oi = [], 0, 0
+        
+        for item in raw_list:
+            strike = int(float(item.get("strike_price", 0)))
+            if atm and abs(strike - atm) > 3000: continue
+            
+            def parse_side(d):
+                if not d: return {"ltp": 0, "oi": 0, "change_oi": 0, "volume": 0, "iv": 0, "delta": 0, "theta": 0, "vega": 0, "gamma": 0}
+                md, og = d.get("market_data") or {}, d.get("option_greeks") or {}
+                raw_iv = float(og.get("iv") or 0)
+                return {
+                    "ltp": md.get("ltp"), "oi": int(md.get("oi") or 0), 
+                    "change_oi": int(md.get("oi") or 0) - int(md.get("prev_oi") or 0),
+                    "volume": md.get("volume", 0), 
+                    "iv": round(raw_iv * 100, 2) if 0 < raw_iv < 1.0 else round(raw_iv, 2), 
+                    "delta": round(float(og.get("delta") or 0), 4),
+                    "theta": round(float(og.get("theta") or 0), 4), 
+                    "vega": round(float(og.get("vega") or 0), 4), 
+                    "gamma": round(float(og.get("gamma") or 0.0005) * 10000, 2)
+                }
+                
+            ce = parse_side(item.get("call_options"))
+            pe = parse_side(item.get("put_options"))
+            total_ce_oi += ce["oi"] or 0
+            total_pe_oi += pe["oi"] or 0
+            chain_rows.append({"strike": strike, "atm": atm is not None and abs(strike - atm) < cfg["step"], "ce": ce, "pe": pe})
+
+    pcr = round(total_pe_oi / max(total_ce_oi, 1), 2)
     chain_rows = inject_prz(chain_rows, expiry, cfg["step"], spot)
     coa_data = calculate_coa(chain_rows, symbol, expiry)
 
     return jsonify({
-        "symbol": symbol, "expiry": expiry, "spot": spot, "pcr": round(total_pe_oi / max(total_ce_oi, 1), 2),
+        "symbol": symbol, "expiry": expiry, "spot": spot, "pcr": pcr,
         "total_ce_oi": total_ce_oi, "total_pe_oi": total_pe_oi, "lot_size": cfg["lot"],
         "chain": chain_rows, "fetched_at": datetime.now().strftime("%H:%M:%S"), "coa": coa_data
     })
@@ -525,7 +632,6 @@ def options_chain():
 def load_saved_token():
     global _access_token
     try:
-        # 🟢 Token now loaded securely from MongoDB!
         token_doc = sys_col.find_one({"_id": "upstox_auth"})
         if not token_doc: return False
         
@@ -550,7 +656,6 @@ def save_token(token):
     global _access_token
     _access_token = token
     try:
-        # 🟢 Token now saved securely to MongoDB!
         sys_col.update_one(
             {"_id": "upstox_auth"},
             {"$set": {"access_token": token, "date": datetime.now().strftime("%Y-%m-%d")}},
