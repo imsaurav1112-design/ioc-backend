@@ -17,7 +17,7 @@ from scipy.optimize import brentq, fsolve
 from functools import wraps
 
 # 🟢 CLOUD & SAAS IMPORTS
-import 
+import razorpay
 from pymongo import MongoClient
 import firebase_admin
 from firebase_admin import credentials, auth
@@ -48,7 +48,6 @@ SYMBOL_MAP = {
 
 # 🟢 FIREBASE ADMIN SETUP (For Security Bouncer)
 try:
-    # Ensure you download your service account JSON from Firebase!
     cred = credentials.Certificate(os.path.join(os.getcwd(), 'firebase-admin.json'))
     firebase_admin.initialize_app(cred)
 except Exception as e:
@@ -65,8 +64,8 @@ try:
 except Exception as e:
     print(f"❌ MongoDB Connection Error: {e}")
 
-# 🟢  SETUP
-_KEY_ID = "rzp_test_ShJD1Ns5T8Wsr1"
+# 🟢 RAZORPAY SETUP
+RAZORPAY_KEY_ID = "rzp_test_ShJD1Ns5T8Wsr1"
 RAZORPAY_KEY_SECRET = "UmqVvBGaSddU0W2LMCcsKYlk"
 rzp_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
@@ -84,6 +83,10 @@ def require_firebase_auth(f):
     """Secures endpoints by verifying the frontend Firebase token."""
     @wraps(f)
     def decorated_function(*args, **kwargs):
+        # 🟢 CORS FIX: Automatically allow browser preflight requests
+        if request.method == "OPTIONS":
+            return jsonify({"status": "ok"}), 200
+            
         header = request.headers.get("Authorization")
         if not header or not header.startswith("Bearer "):
             return jsonify({"error": "Unauthorized Access"}), 401
@@ -404,9 +407,9 @@ threading.Thread(target=background_market_recorder, daemon=True).start()
 
 
 # ══════════════════════════════════════════════════════════
-#  🟢 PAYMENT & SUBSCRIPTION ROUTES ()
+#  🟢 PAYMENT & SUBSCRIPTION ROUTES (RAZORPAY)
 # ══════════════════════════════════════════════════════════
-@app.route('/api/create-subscription', methods=['POST'])
+@app.route('/api/create-subscription', methods=['POST', 'OPTIONS'])
 @require_firebase_auth
 def create_subscription():
     plan_id = request.json.get('plan_id')
@@ -421,18 +424,18 @@ def create_subscription():
     order = rzp_client.order.create(data=order_data)
     return jsonify(order)
 
-@app.route('/api/verify-payment', methods=['POST'])
+@app.route('/api/verify-payment', methods=['POST', 'OPTIONS'])
 @require_firebase_auth
 def verify_payment():
     data = request.json
     plan_id = data.get('plan_id')
     
     try:
-        # 1. Verify  Signature
+        # 1. Verify Razorpay Signature
         rzp_client.utility.verify_payment_signature({
-            '_order_id': data['_order_id'],
-            '_payment_id': data['_payment_id'],
-            '_signature': data['_signature']
+            'razorpay_order_id': data['razorpay_order_id'],
+            'razorpay_payment_id': data['razorpay_payment_id'],
+            'razorpay_signature': data['razorpay_signature']
         })
         
         # 2. Check existing subscription in MongoDB
@@ -472,7 +475,7 @@ def auth_headers(): return {"Authorization": f"Bearer {_access_token}", "Accept"
 @app.route("/health")
 def health(): return jsonify({"status": "ok", "authenticated": _access_token is not None})
 
-@app.route("/expiry-dates")
+@app.route("/expiry-dates", methods=['GET', 'OPTIONS'])
 @require_firebase_auth
 def expiry_dates():
     # 🟢 BOUNCER Check
@@ -486,7 +489,7 @@ def expiry_dates():
     expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
     return jsonify({"symbol": symbol, "expiries": expiries})
 
-@app.route("/api/intraday-history")
+@app.route("/api/intraday-history", methods=['GET', 'OPTIONS'])
 @require_firebase_auth
 def intraday_history():
     # 🟢 BOUNCER Check
@@ -540,7 +543,7 @@ def intraday_history():
         print(f"MongoDB Fetch Error: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route("/options-chain")
+@app.route("/options-chain", methods=['GET', 'OPTIONS'])
 @require_firebase_auth
 def options_chain():
     # 🟢 BOUNCER Check
