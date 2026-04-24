@@ -1,7 +1,7 @@
 """
-InsiderOwl — Upstox Live Market Backend (Commercial Edition)
+InsiderOwl — Upstox Live Market Backend
 ====================================================================
-Includes 9:15-3:30 Automated Background Recorder for NIFTY, BANKNIFTY, SENSEX.
+Includes 9:15-3:30 Automated Background Recorder (CSV Files).
 Prioritizes Native Upstox IV/Greeks for Indices to prevent discrepancies.
 Calculates EOR, EOS using the dual-rate Black-Scholes Engine.
 """
@@ -16,8 +16,6 @@ from scipy.stats import norm
 from scipy.optimize import brentq, fsolve
 from functools import wraps
 
-# 🟢 CLOUD IMPORTS
-from pymongo import MongoClient
 import firebase_admin
 from firebase_admin import credentials, auth
 
@@ -25,17 +23,18 @@ app = Flask(__name__)
 CORS(app)
 
 # ══════════════════════════════════════════════════════════
-#  🔑 CONFIGURATION & CLOUD SETUP
+#  🔑 CONFIGURATION
 # ══════════════════════════════════════════════════════════
 API_KEY      = "3e51765a-3794-41ab-b3c9-4a88e0d55e30"
 API_SECRET   = "1ky9l299rf"
 REDIRECT_URI = "https://ioc-backend-kq9x.onrender.com/callback"
 
-BASE_URL   = "https://api.upstox.com/v2"
-_access_token = None
-
-RECORDS_DIR = os.path.join(os.getcwd(), "InsiderQuant_Records")
+TOKEN_FILE   = os.path.join(os.getcwd(), "upstox_token.json")
+RECORDS_DIR  = os.path.join(os.getcwd(), "InsiderQuant_Records")
 os.makedirs(RECORDS_DIR, exist_ok=True)
+
+BASE_URL     = "https://api.upstox.com/v2"
+_access_token = None
 
 SYMBOL_MAP = {
     "NIFTY":      {"instrument_key": "NSE_INDEX|Nifty 50",            "lot": 75,  "step": 50},
@@ -54,24 +53,13 @@ try:
 except Exception as e:
     print(f"⚠️ Firebase Admin Init Error (Auth will fail): {e}")
 
-# 🟢 MONGODB ATLAS SETUP (For Upstox Token Only)
-MONGO_URI = "mongodb+srv://insideowl:<K@vy4120422>@ioc.ecqcgvo.mongodb.net/?appName=ioc"
-try:
-    mongo_client = MongoClient(MONGO_URI)
-    db = mongo_client["ioc_terminal"]
-    sys_col = db["system_config"] # Tracks Upstox Token securely
-    print("✅ Connected to MongoDB Atlas")
-except Exception as e:
-    print(f"❌ MongoDB Connection Error: {e}")
-
 # ══════════════════════════════════════════════════════════
-#  🛡️ SECURITY MIDDLEWARE (THE BOUNCER)
+#  🛡️ SECURITY MIDDLEWARE (THE BOUNCER + CORS FIX)
 # ══════════════════════════════════════════════════════════
 def require_firebase_auth(f):
-    """Secures endpoints by verifying the frontend Firebase token."""
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        # 1. FORCE EXPLICIT CORS HEADERS ON PREFLIGHT
+        # 🟢 CORS FIX: Automatically allow browser preflight requests
         if request.method == "OPTIONS":
             response = jsonify({"status": "ok"})
             response.headers.add("Access-Control-Allow-Origin", "*")
@@ -79,21 +67,16 @@ def require_firebase_auth(f):
             response.headers.add("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             return response, 200
             
-        # 2. CHECK FOR THE HEADER
         header = request.headers.get("Authorization")
         if not header or not header.startswith("Bearer "):
-            print(f"❌ Missing Header. Received: {header}")
-            return jsonify({"error": "Auth Header Missing", "details": "The browser stripped the token."}), 401
+            return jsonify({"error": "Unauthorized Access"}), 401
         
-        # 3. VERIFY THE FIREBASE TOKEN
         token = header.split(" ")[1]
         try:
             decoded_token = auth.verify_id_token(token)
             request.user = decoded_token
         except Exception as e:
-            print(f"❌ Firebase Auth Failed: {str(e)}")
-            # Send the exact crash reason back to the frontend!
-            return jsonify({"error": "Token Rejected", "details": str(e)}), 401
+            return jsonify({"error": "Invalid or Expired Token", "details": str(e)}), 401
             
         return f(*args, **kwargs)
     return decorated_function
@@ -368,13 +351,12 @@ def fetch_and_record(symbol):
 
 def background_market_recorder():
     while True:
-        time.sleep(120) # Wake up every 2 minutes
+        time.sleep(120) 
         if not _access_token: continue
         
         utcnow = datetime.utcnow()
         ist_now = utcnow + timedelta(hours=5, minutes=30)
-        
-        if ist_now.weekday() > 4: continue # Skip Weekends
+        if ist_now.weekday() > 4: continue 
         
         time_int = ist_now.hour * 100 + ist_now.minute
         if 915 <= time_int <= 1530:
@@ -392,7 +374,7 @@ def auth_headers(): return {"Authorization": f"Bearer {_access_token}", "Accept"
 @app.route("/health")
 def health(): return jsonify({"status": "ok", "authenticated": _access_token is not None})
 
-@app.route("/expiry-dates", methods=['GET', 'OPTIONS'])
+@app.route("/expiry-dates", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def expiry_dates():
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
@@ -404,14 +386,14 @@ def expiry_dates():
     expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
     return jsonify({"symbol": symbol, "expiries": expiries})
 
-@app.route("/api/intraday-history", methods=['GET', 'OPTIONS'])
+@app.route("/api/intraday-history", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def intraday_history():
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
     if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400 # 🟢 Sanitization Fix
     
     expiry = request.args.get("expiry", "").strip()
-    # 🟢 Allows backtester to pass a specific date, otherwise defaults to today
+    # 🟢 Optional Date parameter for the backtester! If not provided, defaults to today.
     target_date = request.args.get("date", datetime.now().strftime("%Y-%m-%d")).strip()
     
     filename = os.path.join(RECORDS_DIR, f"{symbol}_{expiry}_Recorded.csv")
@@ -456,7 +438,7 @@ def intraday_history():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/options-chain", methods=['GET', 'OPTIONS'])
+@app.route("/options-chain", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def options_chain():
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
@@ -513,17 +495,28 @@ def options_chain():
         "chain": chain_rows, "fetched_at": datetime.now().strftime("%H:%M:%S"), "coa": coa_data
     })
 
+@app.route("/records", methods=['GET', 'OPTIONS'], strict_slashes=False)
+def list_records():
+    files = os.listdir(RECORDS_DIR) if os.path.exists(RECORDS_DIR) else []
+    html = '<h2 style="font-family:sans-serif;">Recorded Backtest Data</h2><ul>'
+    for f in sorted(files): html += f'<li><a href="/download/{f}">{f}</a></li>'
+    return html + '</ul>'
+
+@app.route("/download/<filename>", methods=['GET', 'OPTIONS'], strict_slashes=False)
+def download_record(filename):
+    file_path = os.path.join(RECORDS_DIR, filename)
+    if os.path.exists(file_path): return send_file(file_path, as_attachment=True)
+    return "File not found", 404
+
 # ══════════════════════════════════════════════════════════
-#  🟢 CLOUD AUTH FLOW (MONGODB STORED TOKEN)
+#  🟢 LOCAL AUTH FLOW (UPSTOX TOKEN.JSON)
 # ══════════════════════════════════════════════════════════
 def load_saved_token():
     global _access_token
     try:
-        # 🟢 Token now loaded securely from MongoDB!
-        token_doc = sys_col.find_one({"_id": "upstox_auth"})
-        if not token_doc: return False
-        
-        token = token_doc.get("access_token", "")
+        if not os.path.exists(TOKEN_FILE): return False
+        with open(TOKEN_FILE) as f: data = json.load(f)
+        token = data.get("access_token", "")
         if token:
             try:
                 import base64
@@ -535,7 +528,7 @@ def load_saved_token():
                     return True
             except: pass
             
-        if token_doc.get("date") != datetime.now().strftime("%Y-%m-%d"): return False
+        if data.get("date") != datetime.now().strftime("%Y-%m-%d"): return False
         _access_token = token
         return True
     except: return False
@@ -544,12 +537,8 @@ def save_token(token):
     global _access_token
     _access_token = token
     try:
-        # 🟢 Token now saved securely to MongoDB!
-        sys_col.update_one(
-            {"_id": "upstox_auth"},
-            {"$set": {"access_token": token, "date": datetime.now().strftime("%Y-%m-%d")}},
-            upsert=True
-        )
+        with open(TOKEN_FILE, "w") as f:
+            json.dump({"access_token": token, "date": datetime.now().strftime("%Y-%m-%d")}, f)
     except: pass
 
 @app.route("/login")
@@ -568,7 +557,7 @@ def callback_route():
     )
     if resp.status_code == 200:
         save_token(resp.json().get("access_token"))
-        return '<h2 style="color:green; font-family:sans-serif;">✅ Login Successful! Token saved to Cloud DB.</h2>'
+        return '<h2 style="color:green; font-family:sans-serif;">✅ Login Successful! Token saved locally.</h2>'
     return f'<h2 style="color:red; font-family:sans-serif;">❌ Failed:</h2><p>{resp.text}</p>'
 
 
