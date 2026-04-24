@@ -71,19 +71,29 @@ def require_firebase_auth(f):
     """Secures endpoints by verifying the frontend Firebase token."""
     @wraps(f)
     def decorated_function(*args, **kwargs):
+        # 1. FORCE EXPLICIT CORS HEADERS ON PREFLIGHT
         if request.method == "OPTIONS":
-            return jsonify({"status": "ok"}), 200
+            response = jsonify({"status": "ok"})
+            response.headers.add("Access-Control-Allow-Origin", "*")
+            response.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            response.headers.add("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            return response, 200
             
+        # 2. CHECK FOR THE HEADER
         header = request.headers.get("Authorization")
         if not header or not header.startswith("Bearer "):
-            return jsonify({"error": "Unauthorized Access"}), 401
+            print(f"❌ Missing Header. Received: {header}")
+            return jsonify({"error": "Auth Header Missing", "details": "The browser stripped the token."}), 401
         
+        # 3. VERIFY THE FIREBASE TOKEN
         token = header.split(" ")[1]
         try:
             decoded_token = auth.verify_id_token(token)
             request.user = decoded_token
         except Exception as e:
-            return jsonify({"error": "Invalid or Expired Token", "details": str(e)}), 401
+            print(f"❌ Firebase Auth Failed: {str(e)}")
+            # Send the exact crash reason back to the frontend!
+            return jsonify({"error": "Token Rejected", "details": str(e)}), 401
             
         return f(*args, **kwargs)
     return decorated_function
