@@ -374,15 +374,23 @@ def background_market_recorder():
         
         utcnow = datetime.utcnow()
         ist_now = utcnow + timedelta(hours=5, minutes=30)
+        
+        # Skip weekends (Saturday=5, Sunday=6)
         if ist_now.weekday() > 4: continue 
         
         time_int = ist_now.hour * 100 + ist_now.minute
+        
+        # 🟢 NSE & BSE TIMINGS: 9:15 AM to 3:30 PM
         if 915 <= time_int <= 1530:
-            for sym in ["NIFTY", "BANKNIFTY", "SENSEX"]:
+            for sym in ["NIFTY", "BANKNIFTY", "SENSEX"]: # 👈 Trimmed down to just these 3
                 try: fetch_and_record(sym)
                 except Exception as e: print(f"Recording Error for {sym}: {e}")
 
-threading.Thread(target=background_market_recorder, daemon=True).start()
+        # 🟢 MCX TIMINGS: 9:00 AM to 11:30 PM
+        if 900 <= time_int <= 2330:
+            for sym in ["CRUDEOIL", "NATURALGAS"]:
+                try: fetch_and_record(sym)
+                except Exception as e: print(f"Recording Error for {sym}: {e}")
 
 # ══════════════════════════════════════════════════════════
 #  🟢 TERMINAL DATA ROUTES
