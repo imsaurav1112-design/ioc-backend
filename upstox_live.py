@@ -1,13 +1,13 @@
 """
-InsiderOwl — Upstox Live Market Backend
+InsiderOwl — Upstox Live Market Backend (Cloud Edition)
 ====================================================================
-Includes 9:15-3:30 Automated Background Recorder (CSV Files).
+Includes 9:15-3:30 Automated Background Recorder (MongoDB Atlas).
 Prioritizes Native Upstox IV/Greeks for Indices to prevent discrepancies.
 Calculates EOR, EOS using the dual-rate Black-Scholes Engine.
-No MongoDB. 100% Local File Storage.
+Stores Upstox Auth Token securely in the cloud to survive Render restarts.
 """
 
-import os, sys, time, json, requests, csv, threading
+import os, sys, time, json, requests, threading
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from flask import Flask, jsonify, request, send_file
@@ -17,6 +17,8 @@ from scipy.stats import norm
 from scipy.optimize import brentq, fsolve
 from functools import wraps
 
+# 🟢 CLOUD IMPORTS
+from pymongo import MongoClient
 import firebase_admin
 from firebase_admin import credentials, auth
 
@@ -24,17 +26,13 @@ app = Flask(__name__)
 CORS(app)
 
 # ══════════════════════════════════════════════════════════
-#  🔑 CONFIGURATION
+#  🔑 CONFIGURATION & CLOUD SETUP
 # ══════════════════════════════════════════════════════════
 API_KEY      = "3e51765a-3794-41ab-b3c9-4a88e0d55e30"
 API_SECRET   = "1ky9l299rf"
 REDIRECT_URI = "https://ioc-backend-kq9x.onrender.com/callback"
 
-TOKEN_FILE   = os.path.join(os.getcwd(), "upstox_token.json")
-RECORDS_DIR  = os.path.join(os.getcwd(), "InsiderQuant_Records")
-os.makedirs(RECORDS_DIR, exist_ok=True)
-
-BASE_URL     = "https://api.upstox.com/v2"
+BASE_URL   = "https://api.upstox.com/v2"
 _access_token = None
 
 SYMBOL_MAP = {
@@ -47,12 +45,23 @@ SYMBOL_MAP = {
     "NATURALGAS": {"instrument_key": "", "lot": 1250, "step": 5}, 
 }
 
-# 🟢 FIREBASE ADMIN SETUP (For Security Bouncer)
+# 🟢 FIREBASE ADMIN SETUP
 try:
     cred = credentials.Certificate(os.path.join(os.getcwd(), 'firebase-admin.json'))
     firebase_admin.initialize_app(cred)
 except Exception as e:
     print(f"⚠️ Firebase Admin Init Error (Auth will fail): {e}")
+
+# 🟢 MONGODB ATLAS SETUP
+MONGO_URI = "mongodb+srv://insideowl:<K@vy4120422>@ioc.ecqcgvo.mongodb.net/?appName=ioc"
+try:
+    mongo_client = MongoClient(MONGO_URI)
+    db = mongo_client["ioc_terminal"]
+    sys_col = db["system_config"]        # Tracks Upstox Token securely
+    history_col = db["intraday_history"] # Replaces CSVs for Options Chain Data
+    print("✅ Connected to MongoDB Atlas")
+except Exception as e:
+    print(f"❌ MongoDB Connection Error: {e}")
 
 # ══════════════════════════════════════════════════════════
 #  🛡️ SECURITY MIDDLEWARE (THE BOUNCER + CORS FIX)
@@ -60,7 +69,6 @@ except Exception as e:
 def require_firebase_auth(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        # 🟢 CORS FIX: Automatically allow browser preflight requests
         if request.method == "OPTIONS":
             response = jsonify({"status": "ok"})
             response.headers.add("Access-Control-Allow-Origin", "*")
@@ -275,36 +283,36 @@ def calculate_coa(chain_rows, symbol, expiry):
     return {"scenario_id": scenario_id, "scenario_desc": scenario_desc, "support": sup, "resistance": res, "eos": eor_val, "eor": eos_val, "logs": mem['logs']}
 
 # ══════════════════════════════════════════════════════════
-#  🟢 AUTOMATED 9:15 to 3:30 RECORDER (CSV FILES)
+#  🟢 AUTOMATED 9:15 to 3:30 RECORDER (MONGODB)
 # ══════════════════════════════════════════════════════════
 def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
+    """Saves the snapshot directly to MongoDB Atlas instead of a CSV"""
     if not chain_rows or not spot: return
     
-    filename = os.path.join(RECORDS_DIR, f"{symbol}_{expiry}_Recorded.csv")
-    file_exists = os.path.isfile(filename)
     ts = datetime.utcnow() + timedelta(hours=5, minutes=30)
     ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
+    date_str = ts.strftime("%Y-%m-%d")
+    time_key = ts.strftime("%I:%M %p")
 
     step = SYMBOL_MAP[symbol]["step"]
     atm = round(spot / step) * step
     compressed_chain = [r for r in chain_rows if abs(r['strike'] - atm) <= (15 * step)]
 
-    with open(filename, 'a', newline='') as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow([
-                "Timestamp", "Symbol", "Expiry", "Spot", "PCR", "Strike", 
-                "CE_LTP", "CE_OI", "CE_Vol", "CE_IV", "CE_Delta", "CE_Theta", "CE_Vega", "CE_Gamma", 
-                "PE_LTP", "PE_OI", "PE_Vol", "PE_IV", "PE_Delta", "PE_Theta", "PE_Vega", "PE_Gamma"
-            ])
-        for r in compressed_chain:
-            writer.writerow([
-                ts_str, symbol, expiry, spot, pcr, r.get('strike'), 
-                r['ce'].get('ltp', 0), r['ce'].get('oi', 0), r['ce'].get('volume', 0), 
-                r['ce'].get('iv', 0), r['ce'].get('delta', 0), r['ce'].get('theta', 0), r['ce'].get('vega', 0), r['ce'].get('gamma', 0),
-                r['pe'].get('ltp', 0), r['pe'].get('oi', 0), r['pe'].get('volume', 0), 
-                r['pe'].get('iv', 0), r['pe'].get('delta', 0), r['pe'].get('theta', 0), r['pe'].get('vega', 0), r['pe'].get('gamma', 0)
-            ])
+    snapshot = {
+        "symbol": symbol,
+        "expiry": expiry,
+        "date": date_str,
+        "timestamp_str": ts_str,
+        "time_key": time_key,
+        "spot": spot,
+        "pcr": pcr,
+        "chain": compressed_chain
+    }
+
+    try:
+        history_col.insert_one(snapshot)
+    except Exception as e:
+        print(f"MongoDB Record Error: {e}")
 
 def fetch_and_record(symbol):
     cfg = SYMBOL_MAP.get(symbol)
@@ -379,7 +387,7 @@ def health(): return jsonify({"status": "ok", "authenticated": _access_token is 
 @require_firebase_auth
 def expiry_dates():
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
-    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400
+    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400 
     
     cfg = SYMBOL_MAP.get(symbol)
     resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
@@ -391,42 +399,39 @@ def expiry_dates():
 @require_firebase_auth
 def intraday_history():
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
-    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400
+    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400 
     
     expiry = request.args.get("expiry", "").strip()
     target_date = request.args.get("date", datetime.now().strftime("%Y-%m-%d")).strip()
     
-    filename = os.path.join(RECORDS_DIR, f"{symbol}_{expiry}_Recorded.csv")
-    if not os.path.exists(filename):
-        return jsonify([])
-
-    history_map = {}
-    base_oi = {}
-
     try:
-        with open(filename, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                ts_str = row.get("Timestamp", "")
-                if not ts_str.startswith(target_date): continue
+        # 🟢 Query MongoDB instead of searching for a CSV
+        snapshots = list(history_col.find({
+            "symbol": symbol,
+            "expiry": expiry,
+            "date": target_date
+        }).sort("timestamp_str", 1))
 
-                dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                time_key = dt.strftime("%I:%M %p")
-                strike = int(float(row.get("Strike", 0)))
+        if not snapshots: return jsonify([])
 
-                ce_oi = int(float(row.get("CE_OI", 0)))
-                pe_oi = int(float(row.get("PE_OI", 0)))
+        history_map = {}
+        base_oi = {}
 
-                if strike not in base_oi:
-                    base_oi[strike] = {"ce": ce_oi, "pe": pe_oi}
+        for snap in snapshots:
+            time_key = snap["time_key"]
+            if time_key not in history_map: history_map[time_key] = []
 
-                if time_key not in history_map:
-                    history_map[time_key] = []
+            for r in snap["chain"]:
+                strike = r.get("strike", 0)
+                ce_oi = r.get("ce", {}).get("oi", 0)
+                pe_oi = r.get("pe", {}).get("oi", 0)
+
+                if strike not in base_oi: base_oi[strike] = {"ce": ce_oi, "pe": pe_oi}
 
                 history_map[time_key].append({
                     "strike": strike,
-                    "ceVol": int(float(row.get("CE_Vol", 0))),
-                    "peVol": int(float(row.get("PE_Vol", 0))),
+                    "ceVol": r.get("ce", {}).get("volume", 0),
+                    "peVol": r.get("pe", {}).get("volume", 0),
                     "ceOI": ce_oi,
                     "peOI": pe_oi,
                     "ceOIChg": ce_oi - base_oi[strike]["ce"],
@@ -435,14 +440,16 @@ def intraday_history():
 
         formatted_history = [{"time": k, "rows": v} for k, v in history_map.items()]
         return jsonify(formatted_history)
+
     except Exception as e:
+        print(f"MongoDB Fetch Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/options-chain", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def options_chain():
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
-    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400
+    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400 
     
     expiry = request.args.get("expiry", "").strip()
     cfg = SYMBOL_MAP.get(symbol)
@@ -495,28 +502,17 @@ def options_chain():
         "chain": chain_rows, "fetched_at": datetime.now().strftime("%H:%M:%S"), "coa": coa_data
     })
 
-@app.route("/records", methods=['GET', 'OPTIONS'], strict_slashes=False)
-def list_records():
-    files = os.listdir(RECORDS_DIR) if os.path.exists(RECORDS_DIR) else []
-    html = '<h2 style="font-family:sans-serif;">Recorded Backtest Data</h2><ul>'
-    for f in sorted(files): html += f'<li><a href="/download/{f}">{f}</a></li>'
-    return html + '</ul>'
-
-@app.route("/download/<filename>", methods=['GET', 'OPTIONS'], strict_slashes=False)
-def download_record(filename):
-    file_path = os.path.join(RECORDS_DIR, filename)
-    if os.path.exists(file_path): return send_file(file_path, as_attachment=True)
-    return "File not found", 404
-
 # ══════════════════════════════════════════════════════════
-#  🟢 LOCAL AUTH FLOW (UPSTOX TOKEN.JSON)
+#  🟢 CLOUD AUTH FLOW (UPSTOX TO MONGODB)
 # ══════════════════════════════════════════════════════════
 def load_saved_token():
     global _access_token
     try:
-        if not os.path.exists(TOKEN_FILE): return False
-        with open(TOKEN_FILE) as f: data = json.load(f)
-        token = data.get("access_token", "")
+        # 🟢 Token now loaded securely from MongoDB!
+        token_doc = sys_col.find_one({"_id": "upstox_auth"})
+        if not token_doc: return False
+        
+        token = token_doc.get("access_token", "")
         if token:
             try:
                 import base64
@@ -528,7 +524,7 @@ def load_saved_token():
                     return True
             except: pass
             
-        if data.get("date") != datetime.now().strftime("%Y-%m-%d"): return False
+        if token_doc.get("date") != datetime.now().strftime("%Y-%m-%d"): return False
         _access_token = token
         return True
     except: return False
@@ -537,8 +533,12 @@ def save_token(token):
     global _access_token
     _access_token = token
     try:
-        with open(TOKEN_FILE, "w") as f:
-            json.dump({"access_token": token, "date": datetime.now().strftime("%Y-%m-%d")}, f)
+        # 🟢 Token now saved securely to MongoDB!
+        sys_col.update_one(
+            {"_id": "upstox_auth"},
+            {"$set": {"access_token": token, "date": datetime.now().strftime("%Y-%m-%d")}},
+            upsert=True
+        )
     except: pass
 
 @app.route("/login")
@@ -557,10 +557,13 @@ def callback_route():
     )
     if resp.status_code == 200:
         save_token(resp.json().get("access_token"))
-        return '<h2 style="color:green; font-family:sans-serif;">✅ Login Successful! Token saved locally.</h2>'
+        return '<h2 style="color:green; font-family:sans-serif;">✅ Login Successful! Token saved securely to MongoDB.</h2>'
     return f'<h2 style="color:red; font-family:sans-serif;">❌ Failed:</h2><p>{resp.text}</p>'
 
 
+# ══════════════════════════════════════════════════════════
+#  SERVER START
+# ══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     if API_KEY == "your_api_key_here":
         print("WARNING: Add keys to upstox_live.py")
