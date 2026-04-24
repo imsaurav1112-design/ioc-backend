@@ -6,7 +6,7 @@ Prioritizes Native Upstox IV/Greeks for Indices to prevent discrepancies.
 Calculates EOR, EOS using the dual-rate Black-Scholes Engine.
 """
 
-import os, sys, time, json, webbrowser, requests, threading
+import os, sys, time, json, requests, threading
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from flask import Flask, jsonify, request
@@ -16,8 +16,7 @@ from scipy.stats import norm
 from scipy.optimize import brentq, fsolve
 from functools import wraps
 
-# 🟢 CLOUD & SAAS IMPORTS
-import razorpay
+# 🟢 CLOUD IMPORTS
 from pymongo import MongoClient
 import firebase_admin
 from firebase_admin import credentials, auth
@@ -32,7 +31,6 @@ API_KEY      = "3e51765a-3794-41ab-b3c9-4a88e0d55e30"
 API_SECRET   = "1ky9l299rf"
 REDIRECT_URI = "https://ioc-backend-kq9x.onrender.com/callback"
 
-TOKEN_FILE = os.path.join(os.getcwd(), "upstox_token.json")
 BASE_URL   = "https://api.upstox.com/v2"
 _access_token = None
 
@@ -58,22 +56,11 @@ MONGO_URI = "mongodb+srv://insideowl:<db_password>@ioc.ecqcgvo.mongodb.net/?appN
 try:
     mongo_client = MongoClient(MONGO_URI)
     db = mongo_client["ioc_terminal"]
-    users_col = db["subscriptions"]      # Tracks Users & Expiry
+    sys_col = db["system_config"]        # Tracks Upstox Token
     history_col = db["intraday_history"] # Tracks Options Chain Data
     print("✅ Connected to MongoDB Atlas")
 except Exception as e:
     print(f"❌ MongoDB Connection Error: {e}")
-
-# 🟢 RAZORPAY SETUP
-RAZORPAY_KEY_ID = "rzp_test_ShJD1Ns5T8Wsr1"
-RAZORPAY_KEY_SECRET = "UmqVvBGaSddU0W2LMCcsKYlk"
-rzp_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
-
-PLANS = {
-    "1_month": {"price": 24900, "days": 30, "desc": "1 Month Pro Access"},
-    "3_month": {"price": 59900, "days": 90, "desc": "3 Month Pro Access"},
-    "6_month": {"price": 99900, "days": 180, "desc": "6 Month Pro Access"}
-}
 
 
 # ══════════════════════════════════════════════════════════
@@ -83,13 +70,9 @@ def require_firebase_auth(f):
     """Secures endpoints by verifying the frontend Firebase token."""
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        # 🟢 CORS FIX: Explicitly handle the preflight with correct headers
+        # 🟢 CORS FIX: Automatically allow browser preflight requests
         if request.method == "OPTIONS":
-            response = jsonify({"status": "ok"})
-            response.headers.add("Access-Control-Allow-Origin", "*")
-            response.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization")
-            response.headers.add("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            return response, 200
+            return jsonify({"status": "ok"}), 200
             
         header = request.headers.get("Authorization")
         if not header or not header.startswith("Bearer "):
@@ -104,16 +87,6 @@ def require_firebase_auth(f):
             
         return f(*args, **kwargs)
     return decorated_function
-    
-def verify_pro_status(uid):
-    """Checks MongoDB to ensure the user has an active, paid subscription."""
-    user = users_col.find_one({"uid": uid})
-    if not user or not user.get('pro'): return False
-    
-    expiry = user.get('expiry_date')
-    if not expiry or expiry < datetime.now(): return False
-    
-    return True
 
 
 # ══════════════════════════════════════════════════════════
@@ -310,7 +283,7 @@ def calculate_coa(chain_rows, symbol, expiry):
 
 
 # ══════════════════════════════════════════════════════════
-#  🟢 AUTOMATED 9:15 to 3:30 RECORDER (MONGODB UPDATE)
+#  🟢 AUTOMATED 9:15 to 3:30 RECORDER (MONGODB)
 # ══════════════════════════════════════════════════════════
 def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
     """Saves the snapshot directly to MongoDB Atlas"""
@@ -346,14 +319,12 @@ def fetch_and_record(symbol):
     cfg = SYMBOL_MAP.get(symbol)
     if not cfg: return
     
-    # 1. Fetch closest Expiry
     resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
     data = resp.json().get("data") or []
     expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
     if not expiries: return
     closest_expiry = expiries[0]
 
-    # 2. Fetch Spot
     spot = None
     spot_resp = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
     if spot_resp.status_code == 200:
@@ -362,7 +333,6 @@ def fetch_and_record(symbol):
             spot = v.get("last_price")
             break
             
-    # 3. Fetch Chain
     chain_resp = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": cfg["instrument_key"], "expiry_date": closest_expiry}, headers=auth_headers())
     raw_list = chain_resp.json().get("data") or []
     if not raw_list: return
@@ -391,14 +361,12 @@ def fetch_and_record(symbol):
 
 def background_market_recorder():
     while True:
-        time.sleep(120) # Wake up every 2 minutes
+        time.sleep(120) 
         if not _access_token: continue
         
-        # Determine IST time
         utcnow = datetime.utcnow()
         ist_now = utcnow + timedelta(hours=5, minutes=30)
-        
-        if ist_now.weekday() > 4: continue # Skip Weekends (Sat=5, Sun=6)
+        if ist_now.weekday() > 4: continue 
         
         time_int = ist_now.hour * 100 + ist_now.minute
         if 915 <= time_int <= 1530:
@@ -406,69 +374,7 @@ def background_market_recorder():
                 try: fetch_and_record(sym)
                 except Exception as e: print(f"Recording Error for {sym}: {e}")
 
-# Start the background recorder
 threading.Thread(target=background_market_recorder, daemon=True).start()
-
-
-# ══════════════════════════════════════════════════════════
-#  🟢 PAYMENT & SUBSCRIPTION ROUTES (RAZORPAY)
-# ══════════════════════════════════════════════════════════
-@app.route('/api/create-subscription', methods=['POST', 'OPTIONS'], strict_slashes=False)
-@require_firebase_auth
-def create_subscription():
-    plan_id = request.json.get('plan_id')
-    if plan_id not in PLANS: return jsonify({"error": "Invalid Plan"}), 400
-    
-    order_data = {
-        "amount": PLANS[plan_id]["price"],
-        "currency": "INR",
-        "receipt": f"rcpt_{plan_id}_{request.user['uid'][:8]}",
-        "payment_capture": 1
-    }
-    order = rzp_client.order.create(data=order_data)
-    return jsonify(order)
-
-@app.route('/api/verify-payment', methods=['POST', 'OPTIONS'], strict_slashes=False)
-@require_firebase_auth
-def verify_payment():
-    data = request.json
-    plan_id = data.get('plan_id')
-    
-    try:
-        # 1. Verify Razorpay Signature
-        rzp_client.utility.verify_payment_signature({
-            'razorpay_order_id': data['razorpay_order_id'],
-            'razorpay_payment_id': data['razorpay_payment_id'],
-            'razorpay_signature': data['razorpay_signature']
-        })
-        
-        # 2. Check existing subscription in MongoDB
-        user_doc = users_col.find_one({"uid": request.user['uid']})
-        current_expiry = datetime.now()
-        
-        if user_doc and user_doc.get('expiry_date'):
-            if user_doc['expiry_date'] > datetime.now():
-                current_expiry = user_doc['expiry_date']
-        
-        # 3. Calculate new expiry
-        days_to_add = PLANS[plan_id]["days"]
-        new_expiry = current_expiry + timedelta(days=days_to_add)
-        
-        # 4. Save to MongoDB
-        users_col.update_one(
-            {"uid": request.user['uid']}, 
-            {"$set": {
-                "email": request.user['email'], 
-                "expiry_date": new_expiry, 
-                "plan": plan_id,
-                "pro": True
-            }}, 
-            upsert=True
-        )
-        
-        return jsonify({"status": "success", "new_expiry": new_expiry.strftime("%Y-%m-%d")})
-    except Exception as e:
-        return jsonify({"error": "Payment Verification Failed: " + str(e)}), 400
 
 
 # ══════════════════════════════════════════════════════════
@@ -482,10 +388,6 @@ def health(): return jsonify({"status": "ok", "authenticated": _access_token is 
 @app.route("/expiry-dates", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def expiry_dates():
-    # 🟢 BOUNCER Check
-    if not verify_pro_status(request.user['uid']): 
-        return jsonify({"error": "Subscription Required"}), 403
-
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
     cfg = SYMBOL_MAP.get(symbol)
     resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
@@ -496,20 +398,18 @@ def expiry_dates():
 @app.route("/api/intraday-history", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def intraday_history():
-    # 🟢 BOUNCER Check
-    if not verify_pro_status(request.user['uid']): 
-        return jsonify({"error": "Subscription Required"}), 403
-
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
     expiry = request.args.get("expiry", "").strip()
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    
+    # Optional Date parameter for the backtester! If not provided, defaults to today.
+    target_date = request.args.get("date", datetime.now().strftime("%Y-%m-%d")).strip()
 
     try:
-        # Query MongoDB for today's recorded snapshots
+        # Pull history from MongoDB for the specific date
         snapshots = list(history_col.find({
             "symbol": symbol,
             "expiry": expiry,
-            "date": today_str
+            "date": target_date
         }).sort("timestamp_str", 1))
 
         if not snapshots: return jsonify([])
@@ -517,7 +417,6 @@ def intraday_history():
         history_map = {}
         base_oi = {}
 
-        # Reformat MongoDB docs to match the Frontend Chart Engine logic
         for snap in snapshots:
             time_key = snap["time_key"]
             if time_key not in history_map: history_map[time_key] = []
@@ -527,7 +426,6 @@ def intraday_history():
                 ce_oi = r.get("ce", {}).get("oi", 0)
                 pe_oi = r.get("pe", {}).get("oi", 0)
 
-                # Track the first OI of the day to calculate real-time OI Change
                 if strike not in base_oi: base_oi[strike] = {"ce": ce_oi, "pe": pe_oi}
 
                 history_map[time_key].append({
@@ -550,10 +448,6 @@ def intraday_history():
 @app.route("/options-chain", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def options_chain():
-    # 🟢 BOUNCER Check
-    if not verify_pro_status(request.user['uid']): 
-        return jsonify({"error": "Subscription Required"}), 403
-
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
     expiry = request.args.get("expiry", "").strip()
     cfg = SYMBOL_MAP.get(symbol)
@@ -575,7 +469,6 @@ def options_chain():
     for item in raw_list:
         strike = int(float(item.get("strike_price", 0)))
         
-        # 🟢 UPDATED: Expand strike limit from 1500 to 3000
         if atm and abs(strike - atm) > 3000: continue
         
         def parse_side(d):
@@ -610,14 +503,16 @@ def options_chain():
 
 
 # ══════════════════════════════════════════════════════════
-#  🟢 CLOUD AUTH FLOW (UPSTOX)
+#  🟢 CLOUD AUTH FLOW (UPSTOX TO MONGODB)
 # ══════════════════════════════════════════════════════════
 def load_saved_token():
     global _access_token
     try:
-        if not os.path.exists(TOKEN_FILE): return False
-        with open(TOKEN_FILE) as f: data = json.load(f)
-        token = data.get("access_token", "")
+        # Load the token from MongoDB instead of local JSON file
+        token_doc = sys_col.find_one({"_id": "upstox_auth"})
+        if not token_doc: return False
+        
+        token = token_doc.get("access_token", "")
         if token:
             try:
                 import base64
@@ -628,7 +523,8 @@ def load_saved_token():
                     _access_token = token
                     return True
             except: pass
-        if data.get("date") != datetime.now().strftime("%Y-%m-%d"): return False
+            
+        if token_doc.get("date") != datetime.now().strftime("%Y-%m-%d"): return False
         _access_token = token
         return True
     except: return False
@@ -637,8 +533,12 @@ def save_token(token):
     global _access_token
     _access_token = token
     try:
-        with open(TOKEN_FILE, "w") as f:
-            json.dump({"access_token": token, "date": datetime.now().strftime("%Y-%m-%d")}, f)
+        # Save the token to MongoDB so it survives server restarts
+        sys_col.update_one(
+            {"_id": "upstox_auth"},
+            {"$set": {"access_token": token, "date": datetime.now().strftime("%Y-%m-%d")}},
+            upsert=True
+        )
     except: pass
 
 @app.route("/login")
@@ -657,7 +557,7 @@ def callback_route():
     )
     if resp.status_code == 200:
         save_token(resp.json().get("access_token"))
-        return '<h2 style="color:green; font-family:sans-serif;">✅ Login Successful! Token saved.</h2>'
+        return '<h2 style="color:green; font-family:sans-serif;">✅ Login Successful! Token saved securely to MongoDB.</h2>'
     return f'<h2 style="color:red; font-family:sans-serif;">❌ Failed:</h2><p>{resp.text}</p>'
 
 
