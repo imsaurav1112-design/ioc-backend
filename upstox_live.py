@@ -405,36 +405,39 @@ def expiry_dates():
 @require_firebase_auth
 def intraday_history():
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
-    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400 
+    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400
     
     expiry = request.args.get("expiry", "").strip()
     target_date = request.args.get("date", datetime.now().strftime("%Y-%m-%d")).strip()
     
+    filename = os.path.join(RECORDS_DIR, f"{symbol}_{expiry}_Recorded.csv")
+    if not os.path.exists(filename):
+        return jsonify([])
+
+    history_map = {}
+    base_oi = {}
+
     try:
-        # 🟢 Query MongoDB instead of searching for a CSV
-        snapshots = list(history_col.find({
-            "symbol": symbol,
-            "expiry": expiry,
-            "date": target_date
-        }).sort("timestamp_str", 1))
+        with open(filename, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                ts_str = row.get("Timestamp", "")
+                if not ts_str.startswith(target_date): continue
 
-        if not snapshots: return jsonify([])
+                dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                time_key = dt.strftime("%I:%M %p")
+                strike = int(float(row.get("Strike", 0)))
 
-        history_map = {}
-        base_oi = {}
+                ce_oi = int(float(row.get("CE_OI", 0)))
+                pe_oi = int(float(row.get("PE_OI", 0)))
 
-        for snap in snapshots:
-            time_key = snap["time_key"]
-            if time_key not in history_map: history_map[time_key] = []
+                if strike not in base_oi:
+                    base_oi[strike] = {"ce": ce_oi, "pe": pe_oi}
 
-            for r in snap["chain"]:
-                strike = r.get("strike", 0)
-                ce_oi = r.get("ce", {}).get("oi", 0)
-                pe_oi = r.get("pe", {}).get("oi", 0)
+                if time_key not in history_map:
+                    history_map[time_key] = []
 
-                if strike not in base_oi: base_oi[strike] = {"ce": ce_oi, "pe": pe_oi}
-
-               history_map[time_key].append({
+                history_map[time_key].append({
                     "strike": strike,
                     "ceVol": int(float(row.get("CE_Vol", 0))),
                     "peVol": int(float(row.get("PE_Vol", 0))),
@@ -442,17 +445,14 @@ def intraday_history():
                     "peOI": pe_oi,
                     "ceOIChg": ce_oi - base_oi[strike]["ce"],
                     "peOIChg": pe_oi - base_oi[strike]["pe"],
-                    "ceLTP": float(row.get("CE_LTP", 0)), 
-                    "peLTP": float(row.get("PE_LTP", 0))  
+                    "ceLTP": float(row.get("CE_LTP", 0)),
+                    "peLTP": float(row.get("PE_LTP", 0))
                 })
 
         formatted_history = [{"time": k, "rows": v} for k, v in history_map.items()]
         return jsonify(formatted_history)
-
     except Exception as e:
-        print(f"MongoDB Fetch Error: {e}")
         return jsonify({"error": str(e)}), 500
-
 @app.route("/options-chain", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def options_chain():
