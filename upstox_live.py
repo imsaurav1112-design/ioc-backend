@@ -72,8 +72,8 @@ except Exception as e:
 import razorpay
 
 # Razorpay Keys (Get these from your Razorpay Dashboard)
-RZP_KEY_ID = "rzp_test_ShJD1Ns5T8Wsr1"
-RZP_KEY_SECRET = "UmqVvBGaSddU0W2LMCcsKYlk"
+RZP_KEY_ID = "rzp_test_ShbvbudW5LV1v3"
+RZP_KEY_SECRET = "Yz6P5jckKk6OyfuqvZ21YCXG"
 rzp_client = razorpay.Client(auth=(RZP_KEY_ID, RZP_KEY_SECRET))
 
 # New MongoDB Collection for Users
