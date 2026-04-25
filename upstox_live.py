@@ -603,7 +603,7 @@ def user_profile():
 @require_firebase_auth
 def create_order():
     data = request.json
-    plan = data.get('plan') # '1_month', '3_months', '6_months'
+    plan = data.get('plan') 
     
     # Map plans to prices (in paise - multiply INR by 100)
     prices = {"1_month": 24900, "3_months": 59900, "6_months": 99900}
@@ -611,16 +611,21 @@ def create_order():
     
     if not amount: return jsonify({"error": "Invalid plan"}), 400
 
+    # 🟢 FIX: Razorpay receipt max length is 40. 
+    # We use a short prefix + timestamp + first 5 chars of UID to stay well under the limit.
+    short_receipt = f"r_{int(time.time())}_{request.user['uid'][:5]}"
+
     order_data = {
         "amount": amount,
         "currency": "INR",
-        "receipt": f"rcpt_{request.user['uid']}_{int(time.time())}"
+        "receipt": short_receipt
     }
     
     try:
         order = rzp_client.order.create(data=order_data)
         return jsonify({"order_id": order['id'], "amount": amount, "key": RZP_KEY_ID})
     except Exception as e:
+        print(f"RAZORPAY ERROR: {str(e)}") # This will print the exact error to Render logs
         return jsonify({"error": str(e)}), 500
 
 @app.route("/verify-payment", methods=['POST', 'OPTIONS'], strict_slashes=False)
