@@ -69,6 +69,17 @@ try:
 except Exception as e:
     print(f"❌ MongoDB Connection Error: {e}")
 
+import razorpay
+
+# Razorpay Keys (Get these from your Razorpay Dashboard)
+RZP_KEY_ID = "rzp_test_ShJD1Ns5T8Wsr1"
+RZP_KEY_SECRET = "UmqVvBGaSddU0W2LMCcsKYlk"
+rzp_client = razorpay.Client(auth=(RZP_KEY_ID, RZP_KEY_SECRET))
+
+# New MongoDB Collection for Users
+users_col = db["users"]
+
+
 # ══════════════════════════════════════════════════════════
 #  🛡️ SECURITY MIDDLEWARE (THE BOUNCER + CORS FIX)
 # ══════════════════════════════════════════════════════════
@@ -568,7 +579,75 @@ def callback_route():
         return '<h2 style="color:green; font-family:sans-serif;">✅ Login Successful! Token saved securely to MongoDB.</h2>'
     return f'<h2 style="color:red; font-family:sans-serif;">❌ Failed:</h2><p>{resp.text}</p>'
 
+@app.route("/user-profile", methods=['GET', 'OPTIONS'], strict_slashes=False)
+@require_firebase_auth
+def user_profile():
+    uid = request.user['uid']
+    user_doc = users_col.find_one({"_id": uid})
+    
+    if not user_doc:
+        # First time login, create free profile
+        users_col.insert_one({"_id": uid, "tier": "free", "expiry": None})
+        return jsonify({"tier": "free"})
+        
+    # Check if pro has expired
+    if user_doc.get("tier") == "pro":
+        expiry_date = user_doc.get("expiry")
+        if expiry_date and datetime.now() > expiry_date:
+            users_col.update_one({"_id": uid}, {"$set": {"tier": "free"}})
+            return jsonify({"tier": "free"})
+            
+    return jsonify({"tier": user_doc.get("tier", "free")})
 
+@app.route("/create-order", methods=['POST', 'OPTIONS'], strict_slashes=False)
+@require_firebase_auth
+def create_order():
+    data = request.json
+    plan = data.get('plan') # '1_month', '3_months', '6_months'
+    
+    # Map plans to prices (in paise - multiply INR by 100)
+    prices = {"1_month": 24900, "3_months": 59900, "6_months": 99900}
+    amount = prices.get(plan)
+    
+    if not amount: return jsonify({"error": "Invalid plan"}), 400
+
+    order_data = {
+        "amount": amount,
+        "currency": "INR",
+        "receipt": f"rcpt_{request.user['uid']}_{int(time.time())}"
+    }
+    
+    try:
+        order = rzp_client.order.create(data=order_data)
+        return jsonify({"order_id": order['id'], "amount": amount, "key": RZP_KEY_ID})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/verify-payment", methods=['POST', 'OPTIONS'], strict_slashes=False)
+@require_firebase_auth
+def verify_payment():
+    data = request.json
+    try:
+        # Razorpay signature verification
+        rzp_client.utility.verify_payment_signature({
+            'razorpay_order_id': data['razorpay_order_id'],
+            'razorpay_payment_id': data['razorpay_payment_id'],
+            'razorpay_signature': data['razorpay_signature']
+        })
+        
+        # Calculate expiry based on plan
+        plan = data.get('plan')
+        days_to_add = 30 if plan == "1_month" else 90 if plan == "3_months" else 180
+        new_expiry = datetime.now() + timedelta(days=days_to_add)
+        
+        # Upgrade user in MongoDB
+        users_col.update_one(
+            {"_id": request.user['uid']}, 
+            {"$set": {"tier": "pro", "expiry": new_expiry}}
+        )
+        return jsonify({"status": "success"})
+    except razorpay.errors.SignatureVerificationError:
+        return jsonify({"error": "Payment verification failed"}), 400
 # ══════════════════════════════════════════════════════════
 #  SERVER START
 # ══════════════════════════════════════════════════════════
