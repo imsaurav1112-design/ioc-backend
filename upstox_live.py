@@ -422,11 +422,25 @@ def expiry_dates():
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
     if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400 
     
-    cfg = SYMBOL_MAP.get(symbol)
-    resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
-    data = resp.json().get("data") or []
-    expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
-    return jsonify({"symbol": symbol, "expiries": expiries})
+    # Check if the request is coming from the Backtester or the Live Terminal
+    is_backtest = request.headers.get("Referer", "").endswith("backtester.html")
+    
+    if is_backtest:
+        # FOR BACKTESTER: Ask MongoDB what expiries we actually have recorded for this symbol
+        try:
+            saved_expiries = history_col.distinct("exp", {"sym": symbol})
+            # Sort them chronologically
+            expiries = sorted(saved_expiries)
+            return jsonify({"symbol": symbol, "expiries": expiries})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    else:
+        # FOR LIVE TERMINAL: Ask Upstox for current active future expiries
+        cfg = SYMBOL_MAP.get(symbol)
+        resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
+        data = resp.json().get("data") or []
+        expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
+        return jsonify({"symbol": symbol, "expiries": expiries})
 
 @app.route("/api/intraday-history", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
