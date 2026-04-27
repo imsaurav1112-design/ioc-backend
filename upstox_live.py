@@ -630,26 +630,55 @@ def callback_route():
         return '<h2 style="color:green; font-family:sans-serif;">✅ Login Successful! Token saved securely to MongoDB.</h2>'
     return f'<h2 style="color:red; font-family:sans-serif;">❌ Failed:</h2><p>{resp.text}</p>'
 
+import random
+import string
+
 @app.route("/user-profile", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def user_profile():
     uid = request.user['uid']
+    email = request.user.get('email', '')
     user_doc = users_col.find_one({"_id": uid})
     
     if not user_doc:
-        # First time login, create free profile
-        users_col.insert_one({"_id": uid, "tier": "free", "expiry": None})
-        return jsonify({"tier": "free"})
+        # First time login: Create full profile with generated referral code
+        ref_code = "IOC-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        
+        # Check if they signed up using someone else's link
+        # (We will pass this from the frontend later)
+        referred_by = request.args.get("ref", None)
+        
+        new_user = {
+            "_id": uid,
+            "email": email,
+            "tier": "free",
+            "expiry": None,
+            "referral_code": ref_code,
+            "referred_by": referred_by,
+            "wallet_balance": 0.00
+        }
+        users_col.insert_one(new_user)
+        user_doc = new_user
         
     # Check if pro has expired
     if user_doc.get("tier") == "pro":
         expiry_date = user_doc.get("expiry")
         if expiry_date and datetime.now() > expiry_date:
             users_col.update_one({"_id": uid}, {"$set": {"tier": "free"}})
-            return jsonify({"tier": "free"})
+            user_doc["tier"] = "free"
             
-    return jsonify({"tier": user_doc.get("tier", "free")})
-
+    # Format expiry date for the frontend
+    formatted_expiry = None
+    if user_doc.get("expiry"):
+        formatted_expiry = user_doc.get("expiry").strftime("%d %b %Y")
+            
+    return jsonify({
+        "tier": user_doc.get("tier", "free"),
+        "email": user_doc.get("email", email),
+        "referral_code": user_doc.get("referral_code", ""),
+        "wallet_balance": user_doc.get("wallet_balance", 0.00),
+        "expiry_date": formatted_expiry
+    })
 @app.route("/create-order", methods=['POST', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def create_order():
