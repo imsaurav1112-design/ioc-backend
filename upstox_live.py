@@ -638,19 +638,20 @@ import string
 def user_profile():
     uid = request.user['uid']
     email = request.user.get('email', '')
+    # Grab the name from Google Auth, fallback to the start of their email if missing
+    name = request.user.get('name', email.split('@')[0]) 
+    
     user_doc = users_col.find_one({"_id": uid})
     
     if not user_doc:
-        # First time login: Create full profile with generated referral code
+        # 🟢 SCENARIO A: Brand New User
         ref_code = "IOC-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
-        
-        # Check if they signed up using someone else's link
-        # (We will pass this from the frontend later)
         referred_by = request.args.get("ref", None)
         
         new_user = {
             "_id": uid,
             "email": email,
+            "name": name,
             "tier": "free",
             "expiry": None,
             "referral_code": ref_code,
@@ -659,7 +660,23 @@ def user_profile():
         }
         users_col.insert_one(new_user)
         user_doc = new_user
-        
+    else:
+        # 🟢 SCENARIO B: Existing "Legacy" User (Fixing your bug!)
+        updates = {}
+        if "referral_code" not in user_doc:
+            user_doc["referral_code"] = "IOC-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+            updates["referral_code"] = user_doc["referral_code"]
+        if "wallet_balance" not in user_doc:
+            user_doc["wallet_balance"] = 0.00
+            updates["wallet_balance"] = 0.00
+        if "name" not in user_doc:
+            user_doc["name"] = name
+            updates["name"] = name
+            
+        # If any old data was missing, patch the database silently in the background
+        if updates:
+            users_col.update_one({"_id": uid}, {"$set": updates})
+
     # Check if pro has expired
     if user_doc.get("tier") == "pro":
         expiry_date = user_doc.get("expiry")
@@ -667,7 +684,6 @@ def user_profile():
             users_col.update_one({"_id": uid}, {"$set": {"tier": "free"}})
             user_doc["tier"] = "free"
             
-    # Format expiry date for the frontend
     formatted_expiry = None
     if user_doc.get("expiry"):
         formatted_expiry = user_doc.get("expiry").strftime("%d %b %Y")
@@ -675,6 +691,7 @@ def user_profile():
     return jsonify({
         "tier": user_doc.get("tier", "free"),
         "email": user_doc.get("email", email),
+        "name": user_doc.get("name", name), # 👈 Now returning the name
         "referral_code": user_doc.get("referral_code", ""),
         "wallet_balance": user_doc.get("wallet_balance", 0.00),
         "expiry_date": formatted_expiry
