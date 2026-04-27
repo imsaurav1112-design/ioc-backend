@@ -10,7 +10,7 @@ Stores Upstox Auth Token securely in the cloud to survive Render restarts.
 import os, sys, time, json, requests, threading
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 import numpy as np
 from scipy.stats import norm
@@ -53,35 +53,32 @@ except Exception as e:
 # 🟢 MONGODB ATLAS SETUP
 from urllib.parse import quote_plus
 
-# Step 1: Put your actual username and password inside the quotes below
 DB_USERNAME = quote_plus("insideowl")
-DB_PASSWORD = quote_plus("K@vy4120422") # ⚠️ Paste your real password here
+DB_PASSWORD = quote_plus("K@vy4120422")
 
-# Step 2: Python will now safely build the connection string
 MONGO_URI = f"mongodb+srv://{DB_USERNAME}:{DB_PASSWORD}@ioc.ecqcgvo.mongodb.net/?appName=ioc"
 
 try:
     mongo_client = MongoClient(MONGO_URI)
     db = mongo_client["ioc_terminal"]
-    sys_col = db["system_config"]        # Tracks Upstox Token securely
-    history_col = db["intraday_history"] # Replaces CSVs for Options Chain Data
-    print("✅ Connected to MongoDB Atlas")
+    sys_col = db["system_config"]        
+    history_col = db["intraday_history"] 
+    users_col = db["users"]
+
+    # 🟢 TTL INDEX: Automatically delete records older than 40 days (3,456,000 seconds)
+    history_col.create_index("createdAt", expireAfterSeconds=3456000)
+    
+    print("✅ Connected to MongoDB Atlas & TTL Index Verified")
 except Exception as e:
     print(f"❌ MongoDB Connection Error: {e}")
 
 import razorpay
-
-# Razorpay Keys (Get these from your Razorpay Dashboard)
 RZP_KEY_ID = "rzp_test_ShbvbudW5LV1v3"
 RZP_KEY_SECRET = "Yz6P5jckKk6OyfuqvZ21YCXG"
 rzp_client = razorpay.Client(auth=(RZP_KEY_ID, RZP_KEY_SECRET))
 
-# New MongoDB Collection for Users
-users_col = db["users"]
-
-
 # ══════════════════════════════════════════════════════════
-#  🛡️ SECURITY MIDDLEWARE (THE BOUNCER + CORS FIX)
+#  🛡️ SECURITY MIDDLEWARE
 # ══════════════════════════════════════════════════════════
 def require_firebase_auth(f):
     @wraps(f)
@@ -300,34 +297,53 @@ def calculate_coa(chain_rows, symbol, expiry):
     return {"scenario_id": scenario_id, "scenario_desc": scenario_desc, "support": sup, "resistance": res, "eos": eor_val, "eor": eos_val, "logs": mem['logs']}
 
 # ══════════════════════════════════════════════════════════
-#  🟢 AUTOMATED 9:15 to 3:30 RECORDER (MONGODB)
+#  🟢 AUTOMATED 9:15 to 3:30 RECORDER (MONGODB UPDATE)
 # ══════════════════════════════════════════════════════════
 def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
-    """Saves the snapshot directly to MongoDB Atlas instead of a CSV"""
+    """Saves the snapshot directly to MongoDB Atlas in highly compressed array format"""
     if not chain_rows or not spot: return
     
+    # India Standard Time
     ts = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
-    date_str = ts.strftime("%Y-%m-%d")
     time_key = ts.strftime("%I:%M %p")
+    date_str = ts.strftime("%Y-%m-%d")
 
     step = SYMBOL_MAP[symbol]["step"]
     atm = round(spot / step) * step
-    compressed_chain = [r for r in chain_rows if abs(r['strike'] - atm) <= (15 * step)]
+    
+    # Convert dictionaries to pure arrays to save 80% database space
+    compressed_chain = []
+    for r in chain_rows:
+        if abs(r['strike'] - atm) <= (20 * step): # Save up to +/- 20 strikes from ATM
+            # Format: [strike, ce_oi, ce_vol, ce_ltp, pe_oi, pe_vol, pe_ltp]
+            compressed_chain.append([
+                r['strike'],
+                r['ce'].get('oi', 0),
+                r['ce'].get('volume', 0),
+                float(r['ce'].get('ltp', 0)),
+                r['pe'].get('oi', 0),
+                r['pe'].get('volume', 0),
+                float(r['pe'].get('ltp', 0))
+            ])
 
     snapshot = {
-        "symbol": symbol,
-        "expiry": expiry,
+        "sym": symbol,
+        "exp": expiry,
         "date": date_str,
-        "timestamp_str": ts_str,
         "time_key": time_key,
+        "createdAt": datetime.utcnow(), # 🟢 This trigger's MongoDB's 40-Day Auto Delete
         "spot": spot,
         "pcr": pcr,
         "chain": compressed_chain
     }
 
     try:
-        history_col.insert_one(snapshot)
+        # Upsert ensures we don't save duplicate minutes if fetched twice
+        history_col.update_one(
+            {"sym": symbol, "exp": expiry, "date": date_str, "time_key": time_key},
+            {"$set": snapshot},
+            upsert=True
+        )
     except Exception as e:
         print(f"MongoDB Record Error: {e}")
 
@@ -415,55 +431,59 @@ def expiry_dates():
 @app.route("/api/intraday-history", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def intraday_history():
+    """Reads historical data directly from MongoDB to power the terminal charts"""
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
     if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400
     
     expiry = request.args.get("expiry", "").strip()
-    target_date = request.args.get("date", datetime.now().strftime("%Y-%m-%d")).strip()
+    target_date = request.args.get("date", (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")).strip()
     
-    filename = os.path.join(RECORDS_DIR, f"{symbol}_{expiry}_Recorded.csv")
-    if not os.path.exists(filename):
-        return jsonify([])
-
-    history_map = {}
-    base_oi = {}
-
     try:
-        with open(filename, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                ts_str = row.get("Timestamp", "")
-                if not ts_str.startswith(target_date): continue
+        # Fetch today's records for the selected symbol and expiry, sorted by time
+        cursor = history_col.find({"sym": symbol, "exp": expiry, "date": target_date}).sort("createdAt", 1)
+        records = list(cursor)
 
-                dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                time_key = dt.strftime("%I:%M %p")
-                strike = int(float(row.get("Strike", 0)))
+        if not records:
+            return jsonify([])
 
-                ce_oi = int(float(row.get("CE_OI", 0)))
-                pe_oi = int(float(row.get("PE_OI", 0)))
+        history_map = {}
+        base_oi = {}
 
+        for doc in records:
+            time_key = doc.get("time_key")
+            chain_arrays = doc.get("chain", [])
+
+            if time_key not in history_map:
+                history_map[time_key] = []
+
+            for row in chain_arrays:
+                if len(row) < 7: continue
+                # Array structure matched from compress_and_save
+                strike, ce_oi, ce_vol, ce_ltp, pe_oi, pe_vol, pe_ltp = row
+
+                # Save the very first OI of the day as the baseline for OI Change
                 if strike not in base_oi:
                     base_oi[strike] = {"ce": ce_oi, "pe": pe_oi}
 
-                if time_key not in history_map:
-                    history_map[time_key] = []
-
                 history_map[time_key].append({
                     "strike": strike,
-                    "ceVol": int(float(row.get("CE_Vol", 0))),
-                    "peVol": int(float(row.get("PE_Vol", 0))),
+                    "ceVol": ce_vol,
+                    "peVol": pe_vol,
                     "ceOI": ce_oi,
                     "peOI": pe_oi,
                     "ceOIChg": ce_oi - base_oi[strike]["ce"],
                     "peOIChg": pe_oi - base_oi[strike]["pe"],
-                    "ceLTP": float(row.get("CE_LTP", 0)),
-                    "peLTP": float(row.get("PE_LTP", 0))
+                    "ceLTP": ce_ltp,
+                    "peLTP": pe_ltp
                 })
 
         formatted_history = [{"time": k, "rows": v} for k, v in history_map.items()]
         return jsonify(formatted_history)
+
     except Exception as e:
+        print(f"Error fetching history: {e}")
         return jsonify({"error": str(e)}), 500
+
 @app.route("/options-chain", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def options_chain():
@@ -527,7 +547,6 @@ def options_chain():
 def load_saved_token():
     global _access_token
     try:
-        # 🟢 Token now loaded securely from MongoDB!
         token_doc = sys_col.find_one({"_id": "upstox_auth"})
         if not token_doc: return False
         
@@ -552,7 +571,6 @@ def save_token(token):
     global _access_token
     _access_token = token
     try:
-        # 🟢 Token now saved securely to MongoDB!
         sys_col.update_one(
             {"_id": "upstox_auth"},
             {"$set": {"access_token": token, "date": datetime.now().strftime("%Y-%m-%d")}},
@@ -611,8 +629,6 @@ def create_order():
     
     if not amount: return jsonify({"error": "Invalid plan"}), 400
 
-    # 🟢 FIX: Razorpay receipt max length is 40. 
-    # We use a short prefix + timestamp + first 5 chars of UID to stay well under the limit.
     short_receipt = f"r_{int(time.time())}_{request.user['uid'][:5]}"
 
     order_data = {
@@ -625,7 +641,7 @@ def create_order():
         order = rzp_client.order.create(data=order_data)
         return jsonify({"order_id": order['id'], "amount": amount, "key": RZP_KEY_ID})
     except Exception as e:
-        print(f"RAZORPAY ERROR: {str(e)}") # This will print the exact error to Render logs
+        print(f"RAZORPAY ERROR: {str(e)}") 
         return jsonify({"error": str(e)}), 500
 
 @app.route("/verify-payment", methods=['POST', 'OPTIONS'], strict_slashes=False)
@@ -633,19 +649,16 @@ def create_order():
 def verify_payment():
     data = request.json
     try:
-        # Razorpay signature verification
         rzp_client.utility.verify_payment_signature({
             'razorpay_order_id': data['razorpay_order_id'],
             'razorpay_payment_id': data['razorpay_payment_id'],
             'razorpay_signature': data['razorpay_signature']
         })
         
-        # Calculate expiry based on plan
         plan = data.get('plan')
         days_to_add = 30 if plan == "1_month" else 90 if plan == "3_months" else 180
         new_expiry = datetime.now() + timedelta(days=days_to_add)
         
-        # Upgrade user in MongoDB
         users_col.update_one(
             {"_id": request.user['uid']}, 
             {"$set": {"tier": "pro", "expiry": new_expiry}}
@@ -653,6 +666,7 @@ def verify_payment():
         return jsonify({"status": "success"})
     except razorpay.errors.SignatureVerificationError:
         return jsonify({"error": "Payment verification failed"}), 400
+        
 # ══════════════════════════════════════════════════════════
 #  SERVER START
 # ══════════════════════════════════════════════════════════
