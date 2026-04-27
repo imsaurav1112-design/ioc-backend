@@ -666,6 +666,61 @@ def verify_payment():
         return jsonify({"status": "success"})
     except razorpay.errors.SignatureVerificationError:
         return jsonify({"error": "Payment verification failed"}), 400
+
+# ══════════════════════════════════════════════════════════
+#  🛡️ ADMIN COMMAND CENTER ROUTES
+# ══════════════════════════════════════════════════════════
+
+import io
+import csv
+from flask import send_file
+
+@app.route("/api/admin/download-archive", methods=['GET', 'OPTIONS'], strict_slashes=False)
+@require_firebase_auth
+def download_archive():
+    # 🔴 SECURITY GATE: Replace this with YOUR actual Firebase UID
+    ADMIN_UID = "VEbfwlnqrDgy6QoFnN6Bf6qWdr72" 
+    
+    if request.user['uid'] != ADMIN_UID:
+        return jsonify({"error": "Unauthorized. Admin access only."}), 403
+
+    try:
+        # Fetch all options history from MongoDB
+        cursor = history_col.find().sort("createdAt", 1)
+        
+        # Create a CSV in memory
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Write CSV Headers
+        writer.writerow(["Date", "Time", "Symbol", "Expiry", "Spot", "PCR", "Strike", "CE_OI", "CE_Vol", "CE_LTP", "PE_OI", "PE_Vol", "PE_LTP"])
+        
+        row_count = 0
+        for doc in cursor:
+            base_info = [
+                doc.get("date"), doc.get("time_key"), doc.get("sym"), 
+                doc.get("exp"), doc.get("spot"), doc.get("pcr")
+            ]
+            # Flatten the compressed array back into readable CSV rows
+            for chain_row in doc.get("chain", []):
+                if len(chain_row) >= 7:
+                    writer.writerow(base_info + chain_row)
+                    row_count += 1
+                    
+        # Reset memory pointer to beginning of file
+        output.seek(0)
+        
+        # Convert to bytes and send as downloadable file
+        mem_file = io.BytesIO()
+        mem_file.write(output.getvalue().encode('utf-8'))
+        mem_file.seek(0)
+        
+        filename = f"Options_Archive_{datetime.now().strftime('%Y_%m_%d')}.csv"
+        return send_file(mem_file, mimetype='text/csv', as_attachment=True, download_name=filename)
+        
+    except Exception as e:
+        print(f"Archive Download Error: {e}")
+        return jsonify({"error": "Failed to generate archive"}), 500
         
 # ══════════════════════════════════════════════════════════
 #  SERVER START
