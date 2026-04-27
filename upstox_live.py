@@ -442,6 +442,25 @@ def expiry_dates():
         expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
         return jsonify({"symbol": symbol, "expiries": expiries})
 
+@app.route("/api/available-dates", methods=['GET', 'OPTIONS'], strict_slashes=False)
+@require_firebase_auth
+def available_dates():
+    """Queries MongoDB for the exact dates we have recorded for a specific Expiry"""
+    symbol = request.args.get("symbol", "NIFTY").upper().strip()
+    expiry = request.args.get("expiry", "").strip()
+    
+    if not symbol or not expiry: 
+        return jsonify({"error": "Missing parameters"}), 400
+        
+    try:
+        # Get all unique dates saved for this specific chain
+        dates = history_col.distinct("date", {"sym": symbol, "exp": expiry})
+        # Sort them so the newest date is at the top of the dropdown
+        dates = sorted(dates, reverse=True)
+        return jsonify({"dates": dates})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/intraday-history", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def intraday_history():
