@@ -689,7 +689,7 @@ def user_profile():
         if updates:
             users_col.update_one({"_id": uid}, {"$set": updates})
 
-    # 🟢 BULLETPROOF EXPIRY CHECK 
+   # 🟢 BULLETPROOF EXPIRY CHECK 
     formatted_expiry = None
     if user_doc.get("tier") == "pro":
         raw_expiry = user_doc.get("expiry")
@@ -697,7 +697,7 @@ def user_profile():
         if raw_expiry:
             if isinstance(raw_expiry, str):
                 try:
-                    from datetime import datetime
+                    # REMOVED the local import that was crashing it!
                     raw_expiry = datetime.strptime(raw_expiry[:10], "%Y-%m-%d")
                 except:
                     pass 
@@ -719,7 +719,7 @@ def user_profile():
         "wallet_balance": user_doc.get("wallet_balance", 0.00),
         "expiry_date": formatted_expiry
     })
-
+    
 @app.route("/create-order", methods=['POST', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def create_order():
