@@ -699,14 +699,37 @@ def user_profile():
             users_col.update_one({"_id": uid}, {"$set": {"tier": "free"}})
             user_doc["tier"] = "free"
             
+# 🟢 BULLETPROOF EXPIRY CHECK 
     formatted_expiry = None
-    if user_doc.get("expiry"):
-        formatted_expiry = user_doc.get("expiry").strftime("%d %b %Y")
+    if user_doc.get("tier") == "pro":
+        raw_expiry = user_doc.get("expiry")
+        
+        if raw_expiry:
+            # If MongoDB accidentally saved it as a string, try to parse it
+            if isinstance(raw_expiry, str):
+                try:
+                    # Attempt to convert string like "2026-05-28" to a real datetime
+                    from datetime import datetime
+                    # Truncate any extra time data if they typed it weirdly
+                    raw_expiry = datetime.strptime(raw_expiry[:10], "%Y-%m-%d")
+                except:
+                    pass # If it fails, we just leave it as a string
             
+            # Now safely do the math if it is a real datetime object
+            if isinstance(raw_expiry, datetime):
+                if datetime.now() > raw_expiry:
+                    users_col.update_one({"_id": uid}, {"$set": {"tier": "free"}})
+                    user_doc["tier"] = "free"
+                else:
+                    formatted_expiry = raw_expiry.strftime("%d %b %Y")
+            else:
+                # Fallback: if it's still a stubborn string, just display it safely
+                formatted_expiry = str(raw_expiry)
+
     return jsonify({
         "tier": user_doc.get("tier", "free"),
         "email": user_doc.get("email", email),
-        "name": user_doc.get("name", name), # 👈 Now returning the name
+        "name": user_doc.get("name", name), 
         "referral_code": user_doc.get("referral_code", ""),
         "wallet_balance": user_doc.get("wallet_balance", 0.00),
         "expiry_date": formatted_expiry
