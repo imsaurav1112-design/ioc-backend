@@ -17,6 +17,11 @@ from scipy.stats import norm
 from scipy.optimize import brentq, fsolve
 from functools import wraps
 
+# 🟢 SCHEDULER IMPORTS
+from apscheduler.schedulers.background import BackgroundScheduler
+import pytz
+import atexit
+
 # 🟢 CLOUD IMPORTS
 from pymongo import MongoClient
 import firebase_admin
@@ -63,7 +68,7 @@ try:
     db = mongo_client["ioc_terminal"]
     sys_col = db["system_config"]        
     history_col = db["intraday_history"] 
-    users_col = db["users"]
+    history_col = db["history"]
 
     # 🟢 TTL INDEX: Automatically delete records older than 40 days (3,456,000 seconds)
     history_col.create_index("createdAt", expireAfterSeconds=3456000)
@@ -391,22 +396,32 @@ def fetch_and_record(symbol):
     chain_rows = inject_prz(chain_rows, closest_expiry, cfg["step"], spot)
     compress_and_save(symbol, closest_expiry, spot, pcr, chain_rows)
 
-def background_market_recorder():
-    while True:
-        time.sleep(120) 
-        if not _access_token: continue
-        
-        utcnow = datetime.utcnow()
-        ist_now = utcnow + timedelta(hours=5, minutes=30)
-        if ist_now.weekday() > 4: continue 
-        
-        time_int = ist_now.hour * 100 + ist_now.minute
-        if 915 <= time_int <= 1530:
+def record_market_snapshot():
+    # 1. Set timezone to IST
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+    
+    # 2. Market Hours Guardrail (Run ONLY Mon-Fri, 9:15 AM to 3:30 PM)
+    is_weekday = now.weekday() < 5
+    is_market_open = (
+        (now.hour == 9 and now.minute >= 15) or 
+        (now.hour > 9 and now.hour < 15) or 
+        (now.hour == 15 and now.minute <= 30)
+    )
+    
+    if is_weekday and is_market_open:
+        try:
+            # Replaces the threaded logic with a direct call to the core recorder function
             for sym in ["NIFTY", "BANKNIFTY", "SENSEX"]:
-                try: fetch_and_record(sym)
-                except Exception as e: print(f"Recording Error for {sym}: {e}")
+                fetch_and_record(sym)
+            print(f"📸 Snapshot recorded successfully at {now.strftime('%H:%M:%S')} IST")
+            
+        except Exception as e:
+            print(f"❌ Failed to record market snapshot: {str(e)}")
+    else:
+        # Silently pass if the market is closed
+        pass
 
-threading.Thread(target=background_market_recorder, daemon=True).start()
 
 # ══════════════════════════════════════════════════════════
 #  🟢 TERMINAL DATA ROUTES
@@ -696,6 +711,7 @@ def user_profile():
         "wallet_balance": user_doc.get("wallet_balance", 0.00),
         "expiry_date": formatted_expiry
     })
+
 @app.route("/create-order", methods=['POST', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def create_order():
@@ -779,6 +795,7 @@ def verify_payment():
     except Exception as e:
         print(f"❌ SERVER ERROR IN PAYMENT: {str(e)}")
         return jsonify({"error": "Internal server error during verification"}), 500
+
 # ══════════════════════════════════════════════════════════
 #  🛡️ ADMIN COMMAND CENTER ROUTES
 # ══════════════════════════════════════════════════════════
@@ -837,6 +854,18 @@ def download_archive():
 # ══════════════════════════════════════════════════════════
 #  SERVER START
 # ══════════════════════════════════════════════════════════
+# 🟢 Initialize the Background Scheduler
+scheduler = BackgroundScheduler(timezone=pytz.timezone('Asia/Kolkata'))
+
+# Set the timer to run exactly every 1 minute
+scheduler.add_job(func=record_market_snapshot, trigger="interval", minutes=1)
+
+# Start the engine
+scheduler.start()
+
+# Ensure the engine shuts down cleanly if the server crashes or restarts
+atexit.register(lambda: scheduler.shutdown())
+
 if __name__ == "__main__":
     if API_KEY == "your_api_key_here":
         print("WARNING: Add keys to upstox_live.py")
