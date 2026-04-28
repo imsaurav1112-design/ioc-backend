@@ -5,6 +5,7 @@ Includes 9:15-3:30 Automated Background Recorder (MongoDB Atlas).
 Prioritizes Native Upstox IV/Greeks for Indices to prevent discrepancies.
 Calculates EOR, EOS using the dual-rate Black-Scholes Engine.
 Stores Upstox Auth Token securely in the cloud to survive Render restarts.
+Razorpay Webhook Integrated for Drop-Off Prevention.
 """
 
 import os, sys, time, json, requests
@@ -26,6 +27,7 @@ import atexit
 from pymongo import MongoClient
 import firebase_admin
 from firebase_admin import credentials, auth
+import razorpay
 
 app = Flask(__name__)
 CORS(app)
@@ -57,10 +59,8 @@ except Exception as e:
 
 # 🟢 MONGODB ATLAS SETUP
 from urllib.parse import quote_plus
-
 DB_USERNAME = quote_plus("insideowl")
 DB_PASSWORD = quote_plus("K@vy4120422")
-
 MONGO_URI = f"mongodb+srv://{DB_USERNAME}:{DB_PASSWORD}@ioc.ecqcgvo.mongodb.net/?appName=ioc"
 
 try:
@@ -70,14 +70,13 @@ try:
     users_col = db["users"]
     history_col = db["history"]
 
-    # 🟢 TTL INDEX: Automatically delete records older than 40 days (3,456,000 seconds)
+    # TTL INDEX: Automatically delete records older than 40 days (3,456,000 seconds)
     history_col.create_index("createdAt", expireAfterSeconds=3456000)
-    
     print("✅ Connected to MongoDB Atlas & TTL Index Verified")
 except Exception as e:
     print(f"❌ MongoDB Connection Error: {e}")
 
-import razorpay
+# 🟢 RAZORPAY SETUP
 RZP_KEY_ID = "rzp_test_ShbvbudW5LV1v3"
 RZP_KEY_SECRET = "Yz6P5jckKk6OyfuqvZ21YCXG"
 RZP_WEBHOOK_SECRET = "ioc_secure_webhook_2026" 
@@ -306,10 +305,8 @@ def calculate_coa(chain_rows, symbol, expiry):
 #  🟢 AUTOMATED 9:15 to 3:30 RECORDER (MONGODB UPDATE)
 # ══════════════════════════════════════════════════════════
 def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
-    """Saves the snapshot directly to MongoDB Atlas in highly compressed array format"""
     if not chain_rows or not spot: return
     
-    # India Standard Time
     ts = datetime.utcnow() + timedelta(hours=5, minutes=30)
     time_key = ts.strftime("%I:%M %p")
     date_str = ts.strftime("%Y-%m-%d")
@@ -317,11 +314,9 @@ def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
     step = SYMBOL_MAP[symbol]["step"]
     atm = round(spot / step) * step
     
-    # Convert dictionaries to pure arrays to save 80% database space
     compressed_chain = []
     for r in chain_rows:
-        if abs(r['strike'] - atm) <= (20 * step): # Save up to +/- 20 strikes from ATM
-            # Format: [strike, ce_oi, ce_vol, ce_ltp, pe_oi, pe_vol, pe_ltp]
+        if abs(r['strike'] - atm) <= (20 * step): 
             compressed_chain.append([
                 r['strike'],
                 r['ce'].get('oi', 0),
@@ -337,14 +332,13 @@ def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
         "exp": expiry,
         "date": date_str,
         "time_key": time_key,
-        "createdAt": datetime.utcnow(), # 🟢 This trigger's MongoDB's 40-Day Auto Delete
+        "createdAt": datetime.utcnow(), 
         "spot": spot,
         "pcr": pcr,
         "chain": compressed_chain
     }
 
     try:
-        # Upsert ensures we don't save duplicate minutes if fetched twice
         history_col.update_one(
             {"sym": symbol, "exp": expiry, "date": date_str, "time_key": time_key},
             {"$set": snapshot},
@@ -398,11 +392,9 @@ def fetch_and_record(symbol):
     compress_and_save(symbol, closest_expiry, spot, pcr, chain_rows)
 
 def record_market_snapshot():
-    # 1. Set timezone to IST
     ist = pytz.timezone('Asia/Kolkata')
     now = datetime.now(ist)
     
-    # 2. Market Hours Guardrail (Run ONLY Mon-Fri, 9:15 AM to 3:30 PM)
     is_weekday = now.weekday() < 5
     is_market_open = (
         (now.hour == 9 and now.minute >= 15) or 
@@ -412,12 +404,10 @@ def record_market_snapshot():
     
     global _access_token
     if not _access_token:
-        # Silent skip if you haven't logged into Upstox yet today
         return
 
     if is_weekday and is_market_open:
         try:
-            # 🟢 Loop through ALL indices defined in SYMBOL_MAP automatically
             for sym in SYMBOL_MAP.keys():
                 fetch_and_record(sym)
             print(f"📸 Snapshots recorded for ALL indices at {now.strftime('%H:%M:%S')} IST")
@@ -439,20 +429,16 @@ def expiry_dates():
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
     if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400 
     
-    # Check if the request is coming from the Backtester or the Live Terminal
     is_backtest = request.headers.get("Referer", "").endswith("backtester.html")
     
     if is_backtest:
-        # FOR BACKTESTER: Ask MongoDB what expiries we actually have recorded for this symbol
         try:
             saved_expiries = history_col.distinct("exp", {"sym": symbol})
-            # Sort them chronologically
             expiries = sorted(saved_expiries)
             return jsonify({"symbol": symbol, "expiries": expiries})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
     else:
-        # FOR LIVE TERMINAL: Ask Upstox for current active future expiries
         cfg = SYMBOL_MAP.get(symbol)
         resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
         data = resp.json().get("data") or []
@@ -462,7 +448,6 @@ def expiry_dates():
 @app.route("/api/available-dates", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def available_dates():
-    """Queries MongoDB for the exact dates we have recorded for a specific Expiry"""
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
     expiry = request.args.get("expiry", "").strip()
     
@@ -470,9 +455,7 @@ def available_dates():
         return jsonify({"error": "Missing parameters"}), 400
         
     try:
-        # Get all unique dates saved for this specific chain
         dates = history_col.distinct("date", {"sym": symbol, "exp": expiry})
-        # Sort them so the newest date is at the top of the dropdown
         dates = sorted(dates, reverse=True)
         return jsonify({"dates": dates})
     except Exception as e:
@@ -481,7 +464,6 @@ def available_dates():
 @app.route("/api/intraday-history", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def intraday_history():
-    """Reads historical data directly from MongoDB to power the terminal charts"""
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
     if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400
     
@@ -489,7 +471,6 @@ def intraday_history():
     target_date = request.args.get("date", (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")).strip()
     
     try:
-        # Fetch today's records for the selected symbol and expiry, sorted by time
         cursor = history_col.find({"sym": symbol, "exp": expiry, "date": target_date}).sort("createdAt", 1)
         records = list(cursor)
 
@@ -508,10 +489,8 @@ def intraday_history():
 
             for row in chain_arrays:
                 if len(row) < 7: continue
-                # Array structure matched from compress_and_save
                 strike, ce_oi, ce_vol, ce_ltp, pe_oi, pe_vol, pe_ltp = row
 
-                # Save the very first OI of the day as the baseline for OI Change
                 if strike not in base_oi:
                     base_oi[strike] = {"ce": ce_oi, "pe": pe_oi}
 
@@ -671,7 +650,8 @@ def user_profile():
             "expiry": None,
             "referral_code": ref_code,
             "referred_by": referred_by,
-            "wallet_balance": 0.00
+            "wallet_balance": 0.00,
+            "processed_payments": []
         }
         users_col.insert_one(new_user)
         user_doc = new_user
@@ -690,7 +670,7 @@ def user_profile():
         if updates:
             users_col.update_one({"_id": uid}, {"$set": updates})
 
-   # 🟢 BULLETPROOF EXPIRY CHECK 
+    # 🟢 BULLETPROOF EXPIRY CHECK 
     formatted_expiry = None
     if user_doc.get("tier") == "pro":
         raw_expiry = user_doc.get("expiry")
@@ -698,7 +678,6 @@ def user_profile():
         if raw_expiry:
             if isinstance(raw_expiry, str):
                 try:
-                    # REMOVED the local import that was crashing it!
                     raw_expiry = datetime.strptime(raw_expiry[:10], "%Y-%m-%d")
                 except:
                     pass 
@@ -720,7 +699,11 @@ def user_profile():
         "wallet_balance": user_doc.get("wallet_balance", 0.00),
         "expiry_date": formatted_expiry
     })
-    @app.route("/create-order", methods=['POST', 'OPTIONS'], strict_slashes=False)
+
+# ══════════════════════════════════════════════════════════
+#  🟢 BILLING & RAZORPAY WEBHOOK ENGINE
+# ══════════════════════════════════════════════════════════
+@app.route("/create-order", methods=['POST', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def create_order():
     data = request.json
@@ -750,21 +733,15 @@ def create_order():
         print(f"RAZORPAY ERROR: {str(e)}") 
         return jsonify({"error": str(e)}), 500
 
-
-# 🟢 THE MASTER UPGRADE ENGINE (Prevents Double Payouts)
 def process_upgrade_and_commission(uid, plan, payment_id):
-    # 1. Check the Lock: Has this exact payment ID already been processed?
     user_check = users_col.find_one({"_id": uid})
     if not user_check or payment_id in user_check.get("processed_payments", []):
         print(f"🔒 Payment {payment_id} already processed. Skipping to prevent double-billing.")
         return False
 
-    # 2. Calculate Expiry
     days_to_add = 30 if plan == "1_month" else 90 if plan == "3_months" else 180
-    from datetime import datetime, timedelta
     new_expiry = datetime.now() + timedelta(days=days_to_add)
 
-    # 3. Apply Upgrade & Lock the Door
     from pymongo import ReturnDocument
     user_doc = users_col.find_one_and_update(
         {"_id": uid}, 
@@ -775,7 +752,6 @@ def process_upgrade_and_commission(uid, plan, payment_id):
         return_document=ReturnDocument.AFTER
     )
 
-    # 4. Process Commission
     if user_doc and user_doc.get("referred_by"):
         referrer_code = str(user_doc.get("referred_by")).strip().upper()
         prices_inr = {"1_month": 249, "3_months": 599, "6_months": 999}
@@ -791,8 +767,6 @@ def process_upgrade_and_commission(uid, plan, payment_id):
             
     return True
 
-
-# 🟢 THE FRONTEND VERIFICATION (Browser Route)
 @app.route("/verify-payment", methods=['POST', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def verify_payment():
@@ -809,7 +783,6 @@ def verify_payment():
         payment_id = data['razorpay_payment_id']
         
         process_upgrade_and_commission(uid, plan, payment_id)
-        
         return jsonify({"status": "success"})
         
     except razorpay.errors.SignatureVerificationError:
@@ -818,8 +791,6 @@ def verify_payment():
         print(f"❌ SERVER ERROR IN PAYMENT: {str(e)}")
         return jsonify({"error": "Internal server error"}), 500
 
-
-# 🟢 THE BACKEND WEBHOOK (Closed Tab Route)
 @app.route("/razorpay-webhook", methods=['POST'], strict_slashes=False)
 def razorpay_webhook():
     webhook_body = request.get_data(as_text=True)
@@ -846,10 +817,10 @@ def razorpay_webhook():
             process_upgrade_and_commission(uid, plan, payment_id)
             
     return jsonify({"status": "ok"}), 200
+
 # ══════════════════════════════════════════════════════════
 #  🛡️ ADMIN COMMAND CENTER ROUTES
 # ══════════════════════════════════════════════════════════
-
 import io
 import csv
 from flask import send_file
@@ -857,39 +828,27 @@ from flask import send_file
 @app.route("/api/admin/download-archive", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def download_archive():
-    # 🔴 SECURITY GATE: Replace this with YOUR actual Firebase UID
     ADMIN_UID = "VEbfwlnqrDgy6QoFnN6Bf6qWdr72" 
     
     if request.user['uid'] != ADMIN_UID:
         return jsonify({"error": "Unauthorized. Admin access only."}), 403
 
     try:
-        # Fetch all options history from MongoDB
         cursor = history_col.find().sort("createdAt", 1)
-        
-        # Create a CSV in memory
         output = io.StringIO()
         writer = csv.writer(output)
-        
-        # Write CSV Headers
         writer.writerow(["Date", "Time", "Symbol", "Expiry", "Spot", "PCR", "Strike", "CE_OI", "CE_Vol", "CE_LTP", "PE_OI", "PE_Vol", "PE_LTP"])
         
-        row_count = 0
         for doc in cursor:
             base_info = [
                 doc.get("date"), doc.get("time_key"), doc.get("sym"), 
                 doc.get("exp"), doc.get("spot"), doc.get("pcr")
             ]
-            # Flatten the compressed array back into readable CSV rows
             for chain_row in doc.get("chain", []):
                 if len(chain_row) >= 7:
                     writer.writerow(base_info + chain_row)
-                    row_count += 1
                     
-        # Reset memory pointer to beginning of file
         output.seek(0)
-        
-        # Convert to bytes and send as downloadable file
         mem_file = io.BytesIO()
         mem_file.write(output.getvalue().encode('utf-8'))
         mem_file.seek(0)
@@ -907,14 +866,8 @@ def download_archive():
 
 # 🟢 Initialize the Background Scheduler
 scheduler = BackgroundScheduler(timezone=pytz.timezone('Asia/Kolkata'))
-
-# Set the timer to run exactly every 1 minute
 scheduler.add_job(func=record_market_snapshot, trigger="interval", minutes=1)
-
-# Start the engine
 scheduler.start()
-
-# Ensure the engine shuts down cleanly if the server crashes or restarts
 atexit.register(lambda: scheduler.shutdown())
 
 if __name__ == "__main__":
