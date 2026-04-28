@@ -80,6 +80,7 @@ except Exception as e:
 import razorpay
 RZP_KEY_ID = "rzp_test_ShbvbudW5LV1v3"
 RZP_KEY_SECRET = "Yz6P5jckKk6OyfuqvZ21YCXG"
+RZP_WEBHOOK_SECRET = "ioc_secure_webhook_2026" 
 rzp_client = razorpay.Client(auth=(RZP_KEY_ID, RZP_KEY_SECRET))
 
 # ══════════════════════════════════════════════════════════
@@ -719,14 +720,12 @@ def user_profile():
         "wallet_balance": user_doc.get("wallet_balance", 0.00),
         "expiry_date": formatted_expiry
     })
-    
-@app.route("/create-order", methods=['POST', 'OPTIONS'], strict_slashes=False)
+    @app.route("/create-order", methods=['POST', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def create_order():
     data = request.json
     plan = data.get('plan') 
     
-    # Map plans to prices (in paise - multiply INR by 100)
     prices = {"1_month": 24900, "3_months": 59900, "6_months": 99900}
     amount = prices.get(plan)
     
@@ -737,7 +736,11 @@ def create_order():
     order_data = {
         "amount": amount,
         "currency": "INR",
-        "receipt": short_receipt
+        "receipt": short_receipt,
+        "notes": { # 🟢 NEW: Tell Razorpay who this is so the Webhook knows!
+            "uid": request.user['uid'],
+            "plan": plan
+        }
     }
     
     try:
@@ -747,62 +750,106 @@ def create_order():
         print(f"RAZORPAY ERROR: {str(e)}") 
         return jsonify({"error": str(e)}), 500
 
+# 🟢 THE MASTER UPGRADE ENGINE (Prevents Double Payouts)
+def process_upgrade_and_commission(uid, plan, payment_id):
+    # 1. Check the Lock: Has this exact payment ID already been processed?
+    user_check = users_col.find_one({"_id": uid})
+    if not user_check or payment_id in user_check.get("processed_payments", []):
+        print(f"🔒 Payment {payment_id} already processed. Skipping to prevent double-billing.")
+        return False
+
+    # 2. Calculate Expiry
+    days_to_add = 30 if plan == "1_month" else 90 if plan == "3_months" else 180
+    from datetime import datetime, timedelta
+    new_expiry = datetime.now() + timedelta(days=days_to_add)
+
+    # 3. Apply Upgrade & Lock the Door
+    from pymongo import ReturnDocument
+    user_doc = users_col.find_one_and_update(
+        {"_id": uid}, 
+        {
+            "$set": {"tier": "pro", "expiry": new_expiry},
+            "$push": {"processed_payments": payment_id} # 🟢 Save ID to prevent double processing
+        },
+        return_document=ReturnDocument.AFTER
+    )
+
+    # 4. Process Commission
+    if user_doc and user_doc.get("referred_by"):
+        referrer_code = str(user_doc.get("referred_by")).strip().upper()
+        prices_inr = {"1_month": 249, "3_months": 599, "6_months": 999}
+        amount_paid = prices_inr.get(plan, 0)
+        commission = round(amount_paid * 0.20, 2)
+        
+        if commission > 0:
+            users_col.update_one(
+                {"referral_code": referrer_code}, 
+                {"$inc": {"wallet_balance": commission}}
+            )
+            print(f"💰 PAID OUT: ₹{commission} to {referrer_code} for payment {payment_id}")
+            
+    return True
+
+
+# 🟢 THE FRONTEND VERIFICATION (Browser Route)
 @app.route("/verify-payment", methods=['POST', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def verify_payment():
     data = request.json
     try:
-        # 1. Verify Razorpay Signature
         rzp_client.utility.verify_payment_signature({
             'razorpay_order_id': data['razorpay_order_id'],
             'razorpay_payment_id': data['razorpay_payment_id'],
             'razorpay_signature': data['razorpay_signature']
         })
         
-        # 2. Calculate new expiry based on plan
+        uid = request.user['uid']
         plan = data.get('plan')
-        days_to_add = 30 if plan == "1_month" else 90 if plan == "3_months" else 180
-        from datetime import datetime, timedelta
-        new_expiry = datetime.now() + timedelta(days=days_to_add)
+        payment_id = data['razorpay_payment_id']
         
-        # 3. Upgrade the User AND fetch their profile at the same time
-        from pymongo import ReturnDocument
-        user_doc = users_col.find_one_and_update(
-            {"_id": request.user['uid']}, 
-            {"$set": {"tier": "pro", "expiry": new_expiry}},
-            return_document=ReturnDocument.AFTER
-        )
+        # Send to the Master Engine
+        process_upgrade_and_commission(uid, plan, payment_id)
         
-        # 4. THE BULLETPROOF 20% RECURRING PAYOUT
-        if user_doc and user_doc.get("referred_by"):
-            # Strip invisible spaces and force uppercase to guarantee a perfect match
-            referrer_code = str(user_doc.get("referred_by")).strip().upper()
-            
-            # Determine actual Rupee value paid 
-            prices_inr = {"1_month": 249, "3_months": 599, "6_months": 999}
-            amount_paid = prices_inr.get(plan, 0)
-            
-            commission = round(amount_paid * 0.20, 2)
-            
-            print(f"💰 REFERRAL TRIGGERED: Payout of ₹{commission} to code {referrer_code}")
-            
-            if commission > 0:
-                # Find the original referrer and add the money
-                result = users_col.update_one(
-                    {"referral_code": referrer_code}, 
-                    {"$inc": {"wallet_balance": commission}}
-                )
-                print(f"✅ DB MATCHES FOUND: {result.matched_count}")
-            else:
-                print(f"❌ ERROR: Commission was 0. The plan received was '{plan}'.")
-
         return jsonify({"status": "success"})
         
     except razorpay.errors.SignatureVerificationError:
         return jsonify({"error": "Payment verification failed"}), 400
     except Exception as e:
         print(f"❌ SERVER ERROR IN PAYMENT: {str(e)}")
-        return jsonify({"error": "Internal server error during verification"}), 500
+        return jsonify({"error": "Internal server error"}), 500
+
+
+# 🟢 THE BACKEND WEBHOOK (Closed Tab Route)
+@app.route("/razorpay-webhook", methods=['POST'], strict_slashes=False)
+def razorpay_webhook():
+    # ⚠️ Notice there is NO @require_firebase_auth here, because Razorpay is sending this, not the user!
+    webhook_body = request.get_data(as_text=True)
+    webhook_signature = request.headers.get('X-Razorpay-Signature')
+    
+    try:
+        # Verify Razorpay actually sent this
+        rzp_client.utility.verify_webhook_signature(webhook_body, webhook_signature, RZP_WEBHOOK_SECRET)
+    except Exception as e:
+        print(f"🛑 SECURE WEBHOOK BLOCKED: Invalid Signature. {e}")
+        return jsonify({"error": "Invalid signature"}), 400
+
+    data = request.json
+    
+    # We only care about successful captures
+    if data.get('event') == 'payment.captured':
+        payment_entity = data['payload']['payment']['entity']
+        payment_id = payment_entity.get('id')
+        
+        # Grab the identity notes we attached in /create-order
+        notes = payment_entity.get('notes', {})
+        uid = notes.get('uid')
+        plan = notes.get('plan')
+        
+        if uid and plan:
+            print(f"📡 WEBHOOK FIRED for UID {uid[:5]}...")
+            process_upgrade_and_commission(uid, plan, payment_id)
+            
+    return jsonify({"status": "ok"}), 200
 
 # ══════════════════════════════════════════════════════════
 #  🛡️ ADMIN COMMAND CENTER ROUTES
