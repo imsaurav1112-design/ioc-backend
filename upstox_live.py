@@ -7,7 +7,7 @@ Calculates EOR, EOS using the dual-rate Black-Scholes Engine.
 Stores Upstox Auth Token securely in the cloud to survive Render restarts.
 """
 
-import os, sys, time, json, requests, threading
+import os, sys, time, json, requests
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from flask import Flask, jsonify, request
@@ -16,6 +16,11 @@ import numpy as np
 from scipy.stats import norm
 from scipy.optimize import brentq, fsolve
 from functools import wraps
+
+# 🟢 SCHEDULER IMPORTS
+from apscheduler.schedulers.background import BackgroundScheduler
+import pytz
+import atexit
 
 # 🟢 CLOUD IMPORTS
 from pymongo import MongoClient
@@ -62,8 +67,8 @@ try:
     mongo_client = MongoClient(MONGO_URI)
     db = mongo_client["ioc_terminal"]
     sys_col = db["system_config"]        
-    history_col = db["intraday_history"] 
     users_col = db["users"]
+    history_col = db["history"]
 
     # 🟢 TTL INDEX: Automatically delete records older than 40 days (3,456,000 seconds)
     history_col.create_index("createdAt", expireAfterSeconds=3456000)
@@ -391,22 +396,33 @@ def fetch_and_record(symbol):
     chain_rows = inject_prz(chain_rows, closest_expiry, cfg["step"], spot)
     compress_and_save(symbol, closest_expiry, spot, pcr, chain_rows)
 
-def background_market_recorder():
-    while True:
-        time.sleep(120) 
-        if not _access_token: continue
-        
-        utcnow = datetime.utcnow()
-        ist_now = utcnow + timedelta(hours=5, minutes=30)
-        if ist_now.weekday() > 4: continue 
-        
-        time_int = ist_now.hour * 100 + ist_now.minute
-        if 915 <= time_int <= 1530:
-            for sym in ["NIFTY", "BANKNIFTY", "SENSEX"]:
-                try: fetch_and_record(sym)
-                except Exception as e: print(f"Recording Error for {sym}: {e}")
+def record_market_snapshot():
+    # 1. Set timezone to IST
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+    
+    # 2. Market Hours Guardrail (Run ONLY Mon-Fri, 9:15 AM to 3:30 PM)
+    is_weekday = now.weekday() < 5
+    is_market_open = (
+        (now.hour == 9 and now.minute >= 15) or 
+        (now.hour > 9 and now.hour < 15) or 
+        (now.hour == 15 and now.minute <= 30)
+    )
+    
+    global _access_token
+    if not _access_token:
+        # Silent skip if you haven't logged into Upstox yet today
+        return
 
-threading.Thread(target=background_market_recorder, daemon=True).start()
+    if is_weekday and is_market_open:
+        try:
+            # 🟢 Loop through ALL indices defined in SYMBOL_MAP automatically
+            for sym in SYMBOL_MAP.keys():
+                fetch_and_record(sym)
+            print(f"📸 Snapshots recorded for ALL indices at {now.strftime('%H:%M:%S')} IST")
+        except Exception as e:
+            print(f"❌ Failed to record market snapshot: {str(e)}")
+
 
 # ══════════════════════════════════════════════════════════
 #  🟢 TERMINAL DATA ROUTES
@@ -638,13 +654,11 @@ import string
 def user_profile():
     uid = request.user['uid']
     email = request.user.get('email', '')
-    # Grab the name from Google Auth, fallback to the start of their email if missing
     name = request.user.get('name', email.split('@')[0]) 
     
     user_doc = users_col.find_one({"_id": uid})
     
     if not user_doc:
-        # 🟢 SCENARIO A: Brand New User
         ref_code = "IOC-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
         referred_by = request.args.get("ref", None)
         
@@ -661,7 +675,6 @@ def user_profile():
         users_col.insert_one(new_user)
         user_doc = new_user
     else:
-        # 🟢 SCENARIO B: Existing "Legacy" User (Fixing your bug!)
         updates = {}
         if "referral_code" not in user_doc:
             user_doc["referral_code"] = "IOC-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
@@ -673,29 +686,40 @@ def user_profile():
             user_doc["name"] = name
             updates["name"] = name
             
-        # If any old data was missing, patch the database silently in the background
         if updates:
             users_col.update_one({"_id": uid}, {"$set": updates})
 
-    # Check if pro has expired
-    if user_doc.get("tier") == "pro":
-        expiry_date = user_doc.get("expiry")
-        if expiry_date and datetime.now() > expiry_date:
-            users_col.update_one({"_id": uid}, {"$set": {"tier": "free"}})
-            user_doc["tier"] = "free"
-            
+    # 🟢 BULLETPROOF EXPIRY CHECK 
     formatted_expiry = None
-    if user_doc.get("expiry"):
-        formatted_expiry = user_doc.get("expiry").strftime("%d %b %Y")
+    if user_doc.get("tier") == "pro":
+        raw_expiry = user_doc.get("expiry")
+        
+        if raw_expiry:
+            if isinstance(raw_expiry, str):
+                try:
+                    from datetime import datetime
+                    raw_expiry = datetime.strptime(raw_expiry[:10], "%Y-%m-%d")
+                except:
+                    pass 
+            
+            if isinstance(raw_expiry, datetime):
+                if datetime.now() > raw_expiry:
+                    users_col.update_one({"_id": uid}, {"$set": {"tier": "free"}})
+                    user_doc["tier"] = "free"
+                else:
+                    formatted_expiry = raw_expiry.strftime("%d %b %Y")
+            else:
+                formatted_expiry = str(raw_expiry)
             
     return jsonify({
         "tier": user_doc.get("tier", "free"),
         "email": user_doc.get("email", email),
-        "name": user_doc.get("name", name), # 👈 Now returning the name
+        "name": user_doc.get("name", name),
         "referral_code": user_doc.get("referral_code", ""),
         "wallet_balance": user_doc.get("wallet_balance", 0.00),
         "expiry_date": formatted_expiry
     })
+
 @app.route("/create-order", methods=['POST', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def create_order():
@@ -779,6 +803,7 @@ def verify_payment():
     except Exception as e:
         print(f"❌ SERVER ERROR IN PAYMENT: {str(e)}")
         return jsonify({"error": "Internal server error during verification"}), 500
+
 # ══════════════════════════════════════════════════════════
 #  🛡️ ADMIN COMMAND CENTER ROUTES
 # ══════════════════════════════════════════════════════════
@@ -837,6 +862,19 @@ def download_archive():
 # ══════════════════════════════════════════════════════════
 #  SERVER START
 # ══════════════════════════════════════════════════════════
+
+# 🟢 Initialize the Background Scheduler
+scheduler = BackgroundScheduler(timezone=pytz.timezone('Asia/Kolkata'))
+
+# Set the timer to run exactly every 1 minute
+scheduler.add_job(func=record_market_snapshot, trigger="interval", minutes=1)
+
+# Start the engine
+scheduler.start()
+
+# Ensure the engine shuts down cleanly if the server crashes or restarts
+atexit.register(lambda: scheduler.shutdown())
+
 if __name__ == "__main__":
     if API_KEY == "your_api_key_here":
         print("WARNING: Add keys to upstox_live.py")
