@@ -364,17 +364,33 @@ def calculate_coa(chain_rows, symbol, expiry):
 
     plain_english_status = generate_plain_english_status(res['state'], sup['state'])
     
+    # 🟢 R1/S1 & R2/S2 CALCULATIONS
+    step = SYMBOL_MAP.get(symbol, {}).get("step", 50)
+    
     res_row = next((r for r in chain_rows if r['strike'] == res['strike']), None)
     sup_row = next((r for r in chain_rows if r['strike'] == sup['strike']), None)
-    eor_val = res_row['ce_prz'] if res_row else res['strike']
-    eos_val = sup_row['pe_prz'] if sup_row else sup['strike']
+    
+    r1_val = res_row['ce_prz'] if res_row else res['strike']
+    s1_val = sup_row['pe_prz'] if sup_row else sup['strike']
+    
+    # Calculate strikes for R2 (Up) and S2 (Down)
+    r2_strike = res['strike'] + step if res['strike'] > 0 else 0
+    s2_strike = sup['strike'] - step if sup['strike'] > 0 else 0
+    
+    r2_row = next((r for r in chain_rows if r['strike'] == r2_strike), None)
+    s2_row = next((r for r in chain_rows if r['strike'] == s2_strike), None)
+    
+    r2_val = r2_row['ce_prz'] if r2_row else r2_strike
+    s2_val = s2_row['pe_prz'] if s2_row else s2_strike
 
     return {
         "scenario_desc": plain_english_status, 
         "support": sup, 
         "resistance": res, 
-        "eos": eor_val, 
-        "eor": eos_val, 
+        "s1": s1_val,  # Old EOS
+        "r1": r1_val,  # Old EOR
+        "s2": s2_val,  # New S-2 Boundary
+        "r2": r2_val,  # New R-2 Boundary
         "logs": mem['logs']
     }
 # ══════════════════════════════════════════════════════════
