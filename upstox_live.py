@@ -66,8 +66,9 @@ MONGO_URI = f"mongodb+srv://{DB_USERNAME}:{DB_PASSWORD}@ioc.ecqcgvo.mongodb.net/
 try:
     mongo_client = MongoClient(MONGO_URI)
     db = mongo_client["ioc_terminal"]
+    
+    users_col = db["users"]       # 🟢 The missing wire is back!
     sys_col = db["system_config"]        
-    history_col = db["intraday_history"] 
     history_col = db["history"]
 
     # 🟢 TTL INDEX: Automatically delete records older than 40 days (3,456,000 seconds)
