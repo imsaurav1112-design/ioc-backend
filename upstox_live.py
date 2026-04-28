@@ -17,11 +17,6 @@ from scipy.stats import norm
 from scipy.optimize import brentq, fsolve
 from functools import wraps
 
-# 🟢 SCHEDULER IMPORTS
-from apscheduler.schedulers.background import BackgroundScheduler
-import pytz
-import atexit
-
 # 🟢 CLOUD IMPORTS
 from pymongo import MongoClient
 import firebase_admin
@@ -66,10 +61,9 @@ MONGO_URI = f"mongodb+srv://{DB_USERNAME}:{DB_PASSWORD}@ioc.ecqcgvo.mongodb.net/
 try:
     mongo_client = MongoClient(MONGO_URI)
     db = mongo_client["ioc_terminal"]
-    
-    users_col = db["users"]       # 🟢 The missing wire is back!
     sys_col = db["system_config"]        
-    history_col = db["history"]
+    history_col = db["intraday_history"] 
+    users_col = db["users"]
 
     # 🟢 TTL INDEX: Automatically delete records older than 40 days (3,456,000 seconds)
     history_col.create_index("createdAt", expireAfterSeconds=3456000)
@@ -397,32 +391,22 @@ def fetch_and_record(symbol):
     chain_rows = inject_prz(chain_rows, closest_expiry, cfg["step"], spot)
     compress_and_save(symbol, closest_expiry, spot, pcr, chain_rows)
 
-def record_market_snapshot():
-    # 1. Set timezone to IST
-    ist = pytz.timezone('Asia/Kolkata')
-    now = datetime.now(ist)
-    
-    print(f"⏱️ ENGINE TICK: Server thinks the time is {now.strftime('%H:%M:%S')} IST")
-    
-    # Check if we even have a token!
-    global _access_token
-    if not _access_token:
-        print("🛑 ENGINE BLOCKED: No Upstox Access Token! Please visit /login.")
-        return
+def background_market_recorder():
+    while True:
+        time.sleep(120) 
+        if not _access_token: continue
+        
+        utcnow = datetime.utcnow()
+        ist_now = utcnow + timedelta(hours=5, minutes=30)
+        if ist_now.weekday() > 4: continue 
+        
+        time_int = ist_now.hour * 100 + ist_now.minute
+        if 915 <= time_int <= 1530:
+            for sym in ["NIFTY", "BANKNIFTY", "SENSEX"]:
+                try: fetch_and_record(sym)
+                except Exception as e: print(f"Recording Error for {sym}: {e}")
 
-    # 🟢 FORCE BYPASS: We are temporarily ignoring the market hours check for testing!
-    try:
-        print("📡 Fetching live data from Upstox...")
-        for sym in ["NIFTY", "BANKNIFTY", "SENSEX"]:
-            fetch_and_record(sym)
-        print(f"📸 Snapshot recorded successfully at {now.strftime('%H:%M:%S')} IST")
-            
-    except Exception as e:
-        print(f"❌ Failed to record market snapshot: {str(e)}")
-    else:
-        # Silently pass if the market is closed
-        pass
-
+threading.Thread(target=background_market_recorder, daemon=True).start()
 
 # ══════════════════════════════════════════════════════════
 #  🟢 TERMINAL DATA ROUTES
@@ -700,42 +684,18 @@ def user_profile():
             users_col.update_one({"_id": uid}, {"$set": {"tier": "free"}})
             user_doc["tier"] = "free"
             
-# 🟢 BULLETPROOF EXPIRY CHECK 
     formatted_expiry = None
-    if user_doc.get("tier") == "pro":
-        raw_expiry = user_doc.get("expiry")
-        
-        if raw_expiry:
-            # If MongoDB accidentally saved it as a string, try to parse it
-            if isinstance(raw_expiry, str):
-                try:
-                    # Attempt to convert string like "2026-05-28" to a real datetime
-                    from datetime import datetime
-                    # Truncate any extra time data if they typed it weirdly
-                    raw_expiry = datetime.strptime(raw_expiry[:10], "%Y-%m-%d")
-                except:
-                    pass # If it fails, we just leave it as a string
+    if user_doc.get("expiry"):
+        formatted_expiry = user_doc.get("expiry").strftime("%d %b %Y")
             
-            # Now safely do the math if it is a real datetime object
-            if isinstance(raw_expiry, datetime):
-                if datetime.now() > raw_expiry:
-                    users_col.update_one({"_id": uid}, {"$set": {"tier": "free"}})
-                    user_doc["tier"] = "free"
-                else:
-                    formatted_expiry = raw_expiry.strftime("%d %b %Y")
-            else:
-                # Fallback: if it's still a stubborn string, just display it safely
-                formatted_expiry = str(raw_expiry)
-
     return jsonify({
         "tier": user_doc.get("tier", "free"),
         "email": user_doc.get("email", email),
-        "name": user_doc.get("name", name), 
+        "name": user_doc.get("name", name), # 👈 Now returning the name
         "referral_code": user_doc.get("referral_code", ""),
         "wallet_balance": user_doc.get("wallet_balance", 0.00),
         "expiry_date": formatted_expiry
     })
-
 @app.route("/create-order", methods=['POST', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def create_order():
@@ -819,7 +779,6 @@ def verify_payment():
     except Exception as e:
         print(f"❌ SERVER ERROR IN PAYMENT: {str(e)}")
         return jsonify({"error": "Internal server error during verification"}), 500
-
 # ══════════════════════════════════════════════════════════
 #  🛡️ ADMIN COMMAND CENTER ROUTES
 # ══════════════════════════════════════════════════════════
@@ -878,18 +837,6 @@ def download_archive():
 # ══════════════════════════════════════════════════════════
 #  SERVER START
 # ══════════════════════════════════════════════════════════
-# 🟢 Initialize the Background Scheduler
-scheduler = BackgroundScheduler(timezone=pytz.timezone('Asia/Kolkata'))
-
-# Set the timer to run exactly every 1 minute
-scheduler.add_job(func=record_market_snapshot, trigger="interval", minutes=1)
-
-# Start the engine
-scheduler.start()
-
-# Ensure the engine shuts down cleanly if the server crashes or restarts
-atexit.register(lambda: scheduler.shutdown())
-
 if __name__ == "__main__":
     if API_KEY == "your_api_key_here":
         print("WARNING: Add keys to upstox_live.py")
