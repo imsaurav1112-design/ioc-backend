@@ -401,23 +401,23 @@ def record_market_snapshot():
     ist = pytz.timezone('Asia/Kolkata')
     now = datetime.now(ist)
     
-    # 2. Market Hours Guardrail (Run ONLY Mon-Fri, 9:15 AM to 3:30 PM)
-    is_weekday = now.weekday() < 5
-    is_market_open = (
-        (now.hour == 9 and now.minute >= 15) or 
-        (now.hour > 9 and now.hour < 15) or 
-        (now.hour == 15 and now.minute <= 30)
-    )
+    print(f"⏱️ ENGINE TICK: Server thinks the time is {now.strftime('%H:%M:%S')} IST")
     
-    if is_weekday and is_market_open:
-        try:
-            # Replaces the threaded logic with a direct call to the core recorder function
-            for sym in ["NIFTY", "BANKNIFTY", "SENSEX"]:
-                fetch_and_record(sym)
-            print(f"📸 Snapshot recorded successfully at {now.strftime('%H:%M:%S')} IST")
+    # Check if we even have a token!
+    global _access_token
+    if not _access_token:
+        print("🛑 ENGINE BLOCKED: No Upstox Access Token! Please visit /login.")
+        return
+
+    # 🟢 FORCE BYPASS: We are temporarily ignoring the market hours check for testing!
+    try:
+        print("📡 Fetching live data from Upstox...")
+        for sym in ["NIFTY", "BANKNIFTY", "SENSEX"]:
+            fetch_and_record(sym)
+        print(f"📸 Snapshot recorded successfully at {now.strftime('%H:%M:%S')} IST")
             
-        except Exception as e:
-            print(f"❌ Failed to record market snapshot: {str(e)}")
+    except Exception as e:
+        print(f"❌ Failed to record market snapshot: {str(e)}")
     else:
         # Silently pass if the market is closed
         pass
