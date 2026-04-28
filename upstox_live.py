@@ -737,7 +737,7 @@ def create_order():
         "amount": amount,
         "currency": "INR",
         "receipt": short_receipt,
-        "notes": { # 🟢 NEW: Tell Razorpay who this is so the Webhook knows!
+        "notes": { 
             "uid": request.user['uid'],
             "plan": plan
         }
@@ -749,6 +749,7 @@ def create_order():
     except Exception as e:
         print(f"RAZORPAY ERROR: {str(e)}") 
         return jsonify({"error": str(e)}), 500
+
 
 # 🟢 THE MASTER UPGRADE ENGINE (Prevents Double Payouts)
 def process_upgrade_and_commission(uid, plan, payment_id):
@@ -769,7 +770,7 @@ def process_upgrade_and_commission(uid, plan, payment_id):
         {"_id": uid}, 
         {
             "$set": {"tier": "pro", "expiry": new_expiry},
-            "$push": {"processed_payments": payment_id} # 🟢 Save ID to prevent double processing
+            "$push": {"processed_payments": payment_id} 
         },
         return_document=ReturnDocument.AFTER
     )
@@ -807,7 +808,6 @@ def verify_payment():
         plan = data.get('plan')
         payment_id = data['razorpay_payment_id']
         
-        # Send to the Master Engine
         process_upgrade_and_commission(uid, plan, payment_id)
         
         return jsonify({"status": "success"})
@@ -822,12 +822,10 @@ def verify_payment():
 # 🟢 THE BACKEND WEBHOOK (Closed Tab Route)
 @app.route("/razorpay-webhook", methods=['POST'], strict_slashes=False)
 def razorpay_webhook():
-    # ⚠️ Notice there is NO @require_firebase_auth here, because Razorpay is sending this, not the user!
     webhook_body = request.get_data(as_text=True)
     webhook_signature = request.headers.get('X-Razorpay-Signature')
     
     try:
-        # Verify Razorpay actually sent this
         rzp_client.utility.verify_webhook_signature(webhook_body, webhook_signature, RZP_WEBHOOK_SECRET)
     except Exception as e:
         print(f"🛑 SECURE WEBHOOK BLOCKED: Invalid Signature. {e}")
@@ -835,12 +833,10 @@ def razorpay_webhook():
 
     data = request.json
     
-    # We only care about successful captures
     if data.get('event') == 'payment.captured':
         payment_entity = data['payload']['payment']['entity']
         payment_id = payment_entity.get('id')
         
-        # Grab the identity notes we attached in /create-order
         notes = payment_entity.get('notes', {})
         uid = notes.get('uid')
         plan = notes.get('plan')
@@ -850,7 +846,6 @@ def razorpay_webhook():
             process_upgrade_and_commission(uid, plan, payment_id)
             
     return jsonify({"status": "ok"}), 200
-
 # ══════════════════════════════════════════════════════════
 #  🛡️ ADMIN COMMAND CENTER ROUTES
 # ══════════════════════════════════════════════════════════
