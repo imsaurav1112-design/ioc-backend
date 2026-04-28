@@ -235,72 +235,148 @@ def inject_prz(chain_rows, expiry_date_str, step, spot_price):
     return chain_rows
 
 # ══════════════════════════════════════════════════════════
-#  🟢 LTP CALCULATOR ENGINE & COA LOGIC
+#  🟢 ADVANCED STATE-MACHINE & COA LOGIC
 # ══════════════════════════════════════════════════════════
 COA_MEMORY = {}
 
-def evaluate_side(vols_dict):
-    if not vols_dict: return {"strike": 0, "state": "Strong", "target_strike": 0, "pct": 0, "val": 0}
+def evaluate_side(vols_dict, mem_side, side_name):
+    """State Machine that remembers shifting history to prevent false signals"""
+    if not vols_dict: 
+        return {"strike": 0, "state": "Strong", "target_strike": 0, "pct": 0, "val": 0, "msg": ""}
+        
     sorted_vols = sorted(vols_dict.items(), key=lambda x: x[1], reverse=True)
     max_strike, max_vol = sorted_vols[0]
+    sec_strike, sec_vol = 0, 0
+    pct = 0.0
+    
     if len(sorted_vols) > 1:
         sec_strike, sec_vol = sorted_vols[1]
         pct = round((sec_vol / max_vol * 100), 2) if max_vol > 0 else 0
+        
+    # 1. INITIALIZATION (First run of the day)
+    if mem_side["base"] == 0:
+        mem_side["base"] = max_strike
+        return {"strike": max_strike, "state": "Strong", "target_strike": 0, "pct": pct, "val": max_vol, "msg": f"{side_name} established at {max_strike}."}
+
+    msg = ""
+    current_state = "Strong"
+    target = 0
+
+    # 2. BASE CROSSOVER CHECK (A new strike hit 100%)
+    if max_strike != mem_side["base"]:
+        mem_side["old_base"] = mem_side["base"]
+        mem_side["base"] = max_strike
+        mem_side["is_shifting"] = True
+        mem_side["lowest_pct"] = pct
+        msg = f"Shift in Progress: {side_name} base moved to {max_strike}, clearing residual volume at {mem_side['old_base']}."
+        
+    # 3. INTELLIGENT STATE EVALUATION
+    if mem_side["is_shifting"]:
+        # Scenario A: We are looking at the old decaying base
+        if sec_strike == mem_side["old_base"]:
+            mem_side["lowest_pct"] = min(mem_side["lowest_pct"], pct)
+            
+            if pct < 75.0:
+                # The umbilical cord is cut. Shift is fully complete.
+                mem_side["is_shifting"] = False
+                mem_side["old_base"] = 0
+                msg = f"Shift Complete: {side_name} has successfully consolidated at {max_strike}."
+                current_state = "Strong"
+            else:
+                if mem_side["lowest_pct"] < 75.0:
+                    # The Threat Returns! (True STB/STT)
+                    current_state = "STT" if sec_strike > max_strike else "STB"
+                    target = sec_strike
+                    direction = "bullish" if current_state == "STT" else "bearish"
+                    msg = f"Renewed Pressure: Old {side_name} at {sec_strike} is fighting back, creating {direction} pressure."
+                else:
+                    # Shift is just incomplete. Residual noise is ignored.
+                    current_state = "Strong"
+                    
+        # Scenario B: THE ACTIVE CHALLENGER OVERRIDE
+        else:
+            if pct >= 75.0:
+                current_state = "STT" if sec_strike > max_strike else "STB"
+                target = sec_strike
+                direction = "bullish" if current_state == "STT" else "bearish"
+                msg = f"Active Challenger: A new {direction} pressure emerged at {sec_strike}, overriding the old shift."
+            else:
+                current_state = "Strong"
+                
+    # 4. NORMAL STABLE EVALUATION (No shift in progress)
+    else:
         if pct >= 75.0:
-            if sec_strike > max_strike: return {"strike": max_strike, "state": "STT", "target_strike": sec_strike, "pct": pct, "val": max_vol}
-            else: return {"strike": max_strike, "state": "STB", "target_strike": sec_strike, "pct": pct, "val": max_vol}
-    return {"strike": max_strike, "state": "Strong", "target_strike": 0, "pct": 0, "val": max_vol}
+            current_state = "STT" if sec_strike > max_strike else "STB"
+            target = sec_strike
+            
+    # Generate simple pressure messages if state changed normally without a specific override message
+    if msg == "" and current_state != mem_side["state"]:
+        if current_state == "STT": msg = f"Bullish Pressure: {side_name} is Sliding Towards Top ({target})."
+        elif current_state == "STB": msg = f"Bearish Pressure: {side_name} is Sliding Towards Bottom ({target})."
+        elif current_state == "Strong": msg = f"{side_name} has become Strong at {max_strike}."
+        
+    # Save the current state to memory for the next minute
+    mem_side["state"] = current_state
+    mem_side["target"] = target
+    
+    return {"strike": max_strike, "state": current_state, "target_strike": target, "pct": pct, "val": max_vol, "msg": msg}
+
+def generate_plain_english_status(res_state, sup_state):
+    """Creates the beautiful plain-text readout for the UI Header"""
+    res_desc = "in a Strong position"
+    if res_state == "STT": res_desc = "experiencing bullish pressure (Sliding Towards Top)"
+    elif res_state == "STB": res_desc = "experiencing bearish pressure (Sliding Towards Bottom)"
+    
+    sup_desc = "in a Strong position"
+    if sup_state == "STT": sup_desc = "experiencing bullish pressure (Sliding Towards Top)"
+    elif sup_state == "STB": sup_desc = "experiencing bearish pressure (Sliding Towards Bottom)"
+    
+    return f"Currently, Resistance is {res_desc} and Support is {sup_desc}."
 
 def calculate_coa(chain_rows, symbol, expiry):
     global COA_MEMORY
     mem_key = f"{symbol}_{expiry}"
-    if mem_key not in COA_MEMORY: COA_MEMORY[mem_key] = {"sup_strike": 0, "res_strike": 0, "sup_state": "", "res_state": "", "logs": []}
+    
+    # Initialize the complex memory block for this specific expiry
+    if mem_key not in COA_MEMORY: 
+        COA_MEMORY[mem_key] = {
+            "sup_mem": {"base": 0, "old_base": 0, "is_shifting": False, "lowest_pct": 100.0, "state": "Strong", "target": 0},
+            "res_mem": {"base": 0, "old_base": 0, "is_shifting": False, "lowest_pct": 100.0, "state": "Strong", "target": 0},
+            "logs": []
+        }
     mem = COA_MEMORY[mem_key]
     
     ce_vols = {r['strike']: r['ce'].get('volume', 0) for r in chain_rows if r['ce'].get('volume')}
     pe_vols = {r['strike']: r['pe'].get('volume', 0) for r in chain_rows if r['pe'].get('volume')}
-    res, sup = evaluate_side(ce_vols), evaluate_side(pe_vols)
     
-    scenario_id, scenario_desc = 0, ""
-    if sup['state'] == 'Strong' and res['state'] == 'Strong': scenario_id, scenario_desc = 1, "Consolidating. Rangebound between SPL and RPL."
-    elif sup['state'] == 'Strong' and res['state'] == 'STB': scenario_id, scenario_desc = 2, "Mildly Bearish. Pressure is on the downside."
-    elif sup['state'] == 'Strong' and res['state'] == 'STT': scenario_id, scenario_desc = 3, "Mildly Bullish. Pressure is on the upside."
-    elif sup['state'] == 'STB' and res['state'] == 'Strong': scenario_id, scenario_desc = 4, "Mildly Bearish. Downward pressure from Support."
-    elif sup['state'] == 'STT' and res['state'] == 'Strong': scenario_id, scenario_desc = 5, "Mildly Bullish. Upward pressure from Support."
-    elif sup['state'] == 'STT' and res['state'] == 'STT': scenario_id, scenario_desc = 6, "Highly Bullish. Extreme upward pressure."
-    elif sup['state'] == 'STB' and res['state'] == 'STB': scenario_id, scenario_desc = 7, "Highly Bearish. Extreme downward pressure."
-    elif sup['state'] == 'STB' and res['state'] == 'STT': scenario_id, scenario_desc = 8, "Confusion (Diverging). Wide, wild moves possible."
-    elif sup['state'] == 'STT' and res['state'] == 'STB': scenario_id, scenario_desc = 9, "Confusion (Converging). Highly unpredictable."
-
+    # Evaluate both sides using our new State Machine
+    res = evaluate_side(ce_vols, mem['res_mem'], "Resistance")
+    sup = evaluate_side(pe_vols, mem['sup_mem'], "Support")
+    
+    # Add new timeline events to the historical log array
     current_time = datetime.now().strftime("%I:%M %p")
     new_logs = []
-    if mem['sup_strike'] == 0:
-        mem['sup_strike'], mem['res_strike'], mem['sup_state'], mem['res_state'] = sup['strike'], res['strike'], sup['state'], res['state']
-        new_logs.append(f"{current_time} - Market Open: SPL Strong at {sup['strike']}, RPL Strong at {res['strike']}.")
+    if res['msg']: new_logs.append(f"{current_time} - {res['msg']}")
+    if sup['msg']: new_logs.append(f"{current_time} - {sup['msg']}")
     
-    if res['strike'] != mem['res_strike'] and mem['res_strike'] != 0:
-        new_logs.append(f"{current_time} - Scenario Change: Resistance Shifted ({mem['res_strike']} ➔ {res['strike']}).")
-        mem['res_strike'] = res['strike']
-    if sup['strike'] != mem['sup_strike'] and mem['sup_strike'] != 0:
-        new_logs.append(f"{current_time} - Scenario Change: Support Shifted ({mem['sup_strike']} ➔ {sup['strike']}).")
-        mem['sup_strike'] = sup['strike']
+    if new_logs:
+        mem['logs'] = (new_logs + mem['logs'])[:100] # Keeps the last 100 events
 
-    if res['state'] != mem['res_state']:
-        new_logs.append(f"{current_time} - Resistance became {res['state']}.")
-        mem['res_state'] = res['state']
-    if sup['state'] != mem['sup_state']:
-        new_logs.append(f"{current_time} - Support became {sup['state']}.")
-        mem['sup_state'] = sup['state']
-
-    mem['logs'] = (new_logs + mem['logs'])[:50]
+    plain_english_status = generate_plain_english_status(res['state'], sup['state'])
     
     res_row = next((r for r in chain_rows if r['strike'] == res['strike']), None)
     sup_row = next((r for r in chain_rows if r['strike'] == sup['strike']), None)
     eor_val = res_row['ce_prz'] if res_row else res['strike']
     eos_val = sup_row['pe_prz'] if sup_row else sup['strike']
 
-    return {"scenario_id": scenario_id, "scenario_desc": scenario_desc, "support": sup, "resistance": res, "eos": eor_val, "eor": eos_val, "logs": mem['logs']}
-
+    return {
+        "scenario_desc": plain_english_status, 
+        "support": sup, 
+        "resistance": res, 
+        "eos": eor_val, 
+        "eor": eos_val, 
+        "logs": mem['logs']
+    }
 # ══════════════════════════════════════════════════════════
 #  🟢 AUTOMATED 9:15 to 3:30 RECORDER (MONGODB UPDATE)
 # ══════════════════════════════════════════════════════════
