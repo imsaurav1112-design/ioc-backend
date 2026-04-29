@@ -916,15 +916,50 @@ def download_archive():
         return jsonify({"error": "Failed to generate archive"}), 500
         
 # ══════════════════════════════════════════════════════════
+#  🟢 THE EXTERNAL CRON ENGINE
+# ══════════════════════════════════════════════════════════
+@app.route("/cron/record", methods=['GET'])
+def trigger_record():
+    """This route is pinged every 60s by an external cron service (e.g. cron-job.org)"""
+    
+    # Optional Security: Only allow your cron-job to hit this
+    # auth_key = request.args.get("key")
+    # if auth_key != "secret_cron_key_2026":
+    #     return jsonify({"status": "unauthorized"}), 401
+
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+    
+    is_weekday = now.weekday() < 5
+    is_market_open = (
+        (now.hour == 9 and now.minute >= 15) or 
+        (now.hour > 9 and now.hour < 15) or 
+        (now.hour == 15 and now.minute <= 30)
+    )
+    
+    global _access_token
+    print(f"⚙️ CRON HIT [{now.strftime('%H:%M:%S')}]: Weekday={is_weekday}, Open={is_market_open}, Token={'YES' if _access_token else 'NO'}")
+
+    if not _access_token:
+        print("🛑 RECORDER BLOCKED: No Upstox token found! Please visit /login to authenticate.")
+        return jsonify({"status": "blocked", "reason": "no_token"}), 403
+
+    if is_weekday and is_market_open:
+        try:
+            for sym in SYMBOL_MAP.keys():
+                fetch_and_record(sym)
+            print(f"📸 Snapshots batch complete for {now.strftime('%H:%M:%S')} IST")
+            return jsonify({"status": "success", "message": f"Recorded all indices at {now.strftime('%H:%M:%S')} IST"})
+        except Exception as e:
+            print(f"❌ Failed to record market snapshot: {str(e)}")
+            return jsonify({"status": "error", "message": str(e)}), 500
+    
+    print("💤 Market is closed. Engine sleeping.")
+    return jsonify({"status": "sleeping", "message": "Market Closed"}), 200
+
+# ══════════════════════════════════════════════════════════
 #  SERVER START
 # ══════════════════════════════════════════════════════════
-
-# 🟢 Initialize the Background Scheduler
-scheduler = BackgroundScheduler(timezone=pytz.timezone('Asia/Kolkata'))
-scheduler.add_job(func=record_market_snapshot, trigger="interval", minutes=1)
-scheduler.start()
-atexit.register(lambda: scheduler.shutdown())
-
 if __name__ == "__main__":
     if API_KEY == "your_api_key_here":
         print("WARNING: Add keys to upstox_live.py")
