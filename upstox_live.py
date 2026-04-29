@@ -917,15 +917,97 @@ def download_archive():
 # ══════════════════════════════════════════════════════════
 #  🟢 THE EXTERNAL CRON ENGINE
 # ══════════════════════════════════════════════════════════
+def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
+    if not chain_rows or not spot: return
+    
+    ts = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    time_key = ts.strftime("%I:%M %p")
+    date_str = ts.strftime("%Y-%m-%d")
+
+    step = SYMBOL_MAP[symbol]["step"]
+    atm = round(spot / step) * step
+    
+    compressed_chain = []
+    for r in chain_rows:
+        if abs(r['strike'] - atm) <= (20 * step): 
+            compressed_chain.append([
+                r['strike'],
+                r['ce'].get('oi', 0),
+                r['ce'].get('volume', 0),
+                float(r['ce'].get('ltp', 0)),
+                r['pe'].get('oi', 0),
+                r['pe'].get('volume', 0),
+                float(r['pe'].get('ltp', 0))
+            ])
+
+    snapshot = {
+        "sym": symbol,
+        "exp": expiry,
+        "date": date_str,
+        "time_key": time_key,
+        "createdAt": datetime.utcnow(), 
+        "spot": spot,
+        "pcr": pcr,
+        "chain": compressed_chain
+    }
+
+    try:
+        history_col.update_one(
+            {"sym": symbol, "exp": expiry, "date": date_str, "time_key": time_key},
+            {"$set": snapshot},
+            upsert=True
+        )
+        print(f"💾 SAVED TO MONGO: {symbol} at {time_key}")
+    except Exception as e:
+        print(f"❌ MongoDB Record Error: {e}")
+
+def fetch_and_record(symbol):
+    cfg = SYMBOL_MAP.get(symbol)
+    if not cfg: return
+    
+    resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
+    data = resp.json().get("data") or []
+    expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
+    if not expiries: return
+    closest_expiry = expiries[0]
+
+    spot = None
+    spot_resp = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
+    if spot_resp.status_code == 200:
+        safe_spot = spot_resp.json().get("data") or {}
+        for v in safe_spot.values():
+            spot = v.get("last_price")
+            break
+            
+    chain_resp = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": cfg["instrument_key"], "expiry_date": closest_expiry}, headers=auth_headers())
+    raw_list = chain_resp.json().get("data") or []
+    if not raw_list: return
+    
+    if not spot: spot = float(raw_list[0].get("underlying_spot_price", 0))
+
+    chain_rows, total_ce_oi, total_pe_oi = [], 0, 0
+    for item in raw_list:
+        strike = int(float(item.get("strike_price", 0)))
+        def p_side(d):
+            md, og = d.get("market_data") or {}, d.get("option_greeks") or {}
+            raw_iv = float(og.get("iv") or 0)
+            return {
+                "ltp": md.get("ltp", 0), "oi": md.get("oi", 0), "volume": md.get("volume", 0),
+                "iv": raw_iv * 100 if 0 < raw_iv < 1.0 else raw_iv, 
+                "delta": og.get("delta", 0), "theta": og.get("theta", 0), "vega": og.get("vega", 0), "gamma": float(og.get("gamma") or 0.0005) * 10000
+            }
+        ce, pe = p_side(item.get("call_options") or {}), p_side(item.get("put_options") or {})
+        total_ce_oi += ce["oi"]
+        total_pe_oi += pe["oi"]
+        chain_rows.append({"strike": strike, "ce": ce, "pe": pe})
+        
+    pcr = round(total_pe_oi / max(total_ce_oi, 1), 2)
+    chain_rows = inject_prz(chain_rows, closest_expiry, cfg["step"], spot)
+    compress_and_save(symbol, closest_expiry, spot, pcr, chain_rows)
+
 @app.route("/cron/record", methods=['GET'])
 def trigger_record():
-    """This route is pinged every 60s by an external cron service (e.g. cron-job.org)"""
-    
-    # Optional Security: Only allow your cron-job to hit this
-    # auth_key = request.args.get("key")
-    # if auth_key != "secret_cron_key_2026":
-    #     return jsonify({"status": "unauthorized"}), 401
-
+    """This route is pinged every 60s by an external cron service"""
     ist = pytz.timezone('Asia/Kolkata')
     now = datetime.now(ist)
     
