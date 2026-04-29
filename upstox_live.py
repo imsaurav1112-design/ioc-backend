@@ -1,11 +1,10 @@
 """
 InsiderOwl — Upstox Live Market Backend (Cloud Edition)
 ====================================================================
-Includes 9:15-3:30 Automated Background Recorder (MongoDB Atlas).
-Prioritizes Native Upstox IV/Greeks for Indices to prevent discrepancies.
-Calculates EOR, EOS using the dual-rate Black-Scholes Engine.
-Stores Upstox Auth Token securely in the cloud to survive Render restarts.
-Razorpay Webhook Integrated for Drop-Off Prevention.
+Includes External Cron Recorder (MongoDB Atlas).
+Prioritizes Native Upstox IV/Greeks for Indices.
+Advanced COA State Machine (S2/R2, STT/STB).
+Razorpay Webhooks & Wallet Discount Engine.
 """
 
 import os, sys, time, json, requests
@@ -17,10 +16,7 @@ import numpy as np
 from scipy.stats import norm
 from scipy.optimize import brentq, fsolve
 from functools import wraps
-
-# 🟢 SCHEDULER IMPORTS
 import pytz
-import atexit
 
 # 🟢 CLOUD IMPORTS
 from pymongo import MongoClient
@@ -40,6 +36,9 @@ REDIRECT_URI = "https://ioc-backend-kq9x.onrender.com/callback"
 
 BASE_URL   = "https://api.upstox.com/v2"
 _access_token = None
+
+def auth_headers(): 
+    return {"Authorization": f"Bearer {_access_token}", "Accept": "application/json"}
 
 SYMBOL_MAP = {
     "NIFTY":      {"instrument_key": "NSE_INDEX|Nifty 50",            "lot": 75,  "step": 50},
@@ -69,7 +68,6 @@ try:
     users_col = db["users"]
     history_col = db["history"]
 
-    # TTL INDEX: Automatically delete records older than 40 days (3,456,000 seconds)
     history_col.create_index("createdAt", expireAfterSeconds=3456000)
     print("✅ Connected to MongoDB Atlas & TTL Index Verified")
 except Exception as e:
@@ -239,7 +237,6 @@ def inject_prz(chain_rows, expiry_date_str, step, spot_price):
 COA_MEMORY = {}
 
 def evaluate_side(vols_dict, mem_side, side_name):
-    """State Machine that remembers shifting history to prevent false signals"""
     if not vols_dict: 
         return {"strike": 0, "state": "Strong", "target_strike": 0, "pct": 0, "val": 0, "msg": ""}
         
@@ -252,7 +249,6 @@ def evaluate_side(vols_dict, mem_side, side_name):
         sec_strike, sec_vol = sorted_vols[1]
         pct = round((sec_vol / max_vol * 100), 2) if max_vol > 0 else 0
         
-    # 1. INITIALIZATION (First run of the day)
     if mem_side["base"] == 0:
         mem_side["base"] = max_strike
         return {"strike": max_strike, "state": "Strong", "target_strike": 0, "pct": pct, "val": max_vol, "msg": f"{side_name} established at {max_strike}."}
@@ -261,7 +257,6 @@ def evaluate_side(vols_dict, mem_side, side_name):
     current_state = "Strong"
     target = 0
 
-    # 2. BASE CROSSOVER CHECK (A new strike hit 100%)
     if max_strike != mem_side["base"]:
         mem_side["old_base"] = mem_side["base"]
         mem_side["base"] = max_strike
@@ -269,30 +264,22 @@ def evaluate_side(vols_dict, mem_side, side_name):
         mem_side["lowest_pct"] = pct
         msg = f"Shift in Progress: {side_name} base moved to {max_strike}, clearing residual volume at {mem_side['old_base']}."
         
-    # 3. INTELLIGENT STATE EVALUATION
     if mem_side["is_shifting"]:
-        # Scenario A: We are looking at the old decaying base
         if sec_strike == mem_side["old_base"]:
             mem_side["lowest_pct"] = min(mem_side["lowest_pct"], pct)
-            
             if pct < 75.0:
-                # The umbilical cord is cut. Shift is fully complete.
                 mem_side["is_shifting"] = False
                 mem_side["old_base"] = 0
                 msg = f"Shift Complete: {side_name} has successfully consolidated at {max_strike}."
                 current_state = "Strong"
             else:
                 if mem_side["lowest_pct"] < 75.0:
-                    # The Threat Returns! (True STB/STT)
                     current_state = "STT" if sec_strike > max_strike else "STB"
                     target = sec_strike
                     direction = "bullish" if current_state == "STT" else "bearish"
                     msg = f"Renewed Pressure: Old {side_name} at {sec_strike} is fighting back, creating {direction} pressure."
                 else:
-                    # Shift is just incomplete. Residual noise is ignored.
                     current_state = "Strong"
-                    
-        # Scenario B: THE ACTIVE CHALLENGER OVERRIDE
         else:
             if pct >= 75.0:
                 current_state = "STT" if sec_strike > max_strike else "STB"
@@ -301,27 +288,22 @@ def evaluate_side(vols_dict, mem_side, side_name):
                 msg = f"Active Challenger: A new {direction} pressure emerged at {sec_strike}, overriding the old shift."
             else:
                 current_state = "Strong"
-                
-    # 4. NORMAL STABLE EVALUATION (No shift in progress)
     else:
         if pct >= 75.0:
             current_state = "STT" if sec_strike > max_strike else "STB"
             target = sec_strike
             
-    # Generate simple pressure messages if state changed normally without a specific override message
     if msg == "" and current_state != mem_side["state"]:
         if current_state == "STT": msg = f"Bullish Pressure: {side_name} is Sliding Towards Top ({target})."
         elif current_state == "STB": msg = f"Bearish Pressure: {side_name} is Sliding Towards Bottom ({target})."
         elif current_state == "Strong": msg = f"{side_name} has become Strong at {max_strike}."
         
-    # Save the current state to memory for the next minute
     mem_side["state"] = current_state
     mem_side["target"] = target
     
     return {"strike": max_strike, "state": current_state, "target_strike": target, "pct": pct, "val": max_vol, "msg": msg}
 
 def generate_plain_english_status(res_state, sup_state):
-    """Creates the beautiful plain-text readout for the UI Header"""
     res_desc = "in a Strong position"
     if res_state == "STT": res_desc = "experiencing bullish pressure (Sliding Towards Top)"
     elif res_state == "STB": res_desc = "experiencing bearish pressure (Sliding Towards Bottom)"
@@ -336,7 +318,6 @@ def calculate_coa(chain_rows, symbol, expiry):
     global COA_MEMORY
     mem_key = f"{symbol}_{expiry}"
     
-    # Initialize the complex memory block for this specific expiry
     if mem_key not in COA_MEMORY: 
         COA_MEMORY[mem_key] = {
             "sup_mem": {"base": 0, "old_base": 0, "is_shifting": False, "lowest_pct": 100.0, "state": "Strong", "target": 0},
@@ -348,22 +329,19 @@ def calculate_coa(chain_rows, symbol, expiry):
     ce_vols = {r['strike']: r['ce'].get('volume', 0) for r in chain_rows if r['ce'].get('volume')}
     pe_vols = {r['strike']: r['pe'].get('volume', 0) for r in chain_rows if r['pe'].get('volume')}
     
-    # Evaluate both sides using our new State Machine
     res = evaluate_side(ce_vols, mem['res_mem'], "Resistance")
     sup = evaluate_side(pe_vols, mem['sup_mem'], "Support")
     
-    # Add new timeline events to the historical log array
     current_time = datetime.now().strftime("%I:%M %p")
     new_logs = []
     if res['msg']: new_logs.append(f"{current_time} - {res['msg']}")
     if sup['msg']: new_logs.append(f"{current_time} - {sup['msg']}")
     
     if new_logs:
-        mem['logs'] = (new_logs + mem['logs'])[:100] # Keeps the last 100 events
+        mem['logs'] = (new_logs + mem['logs'])[:100] 
 
     plain_english_status = generate_plain_english_status(res['state'], sup['state'])
     
-    # 🟢 R1/S1 & R2/S2 CALCULATIONS
     step = SYMBOL_MAP.get(symbol, {}).get("step", 50)
     
     res_row = next((r for r in chain_rows if r['strike'] == res['strike']), None)
@@ -372,7 +350,6 @@ def calculate_coa(chain_rows, symbol, expiry):
     r1_val = res_row['ce_prz'] if res_row else res['strike']
     s1_val = sup_row['pe_prz'] if sup_row else sup['strike']
     
-    # Calculate strikes for R2 (Up) and S2 (Down)
     r2_strike = res['strike'] + step if res['strike'] > 0 else 0
     s2_strike = sup['strike'] - step if sup['strike'] > 0 else 0
     
@@ -386,15 +363,17 @@ def calculate_coa(chain_rows, symbol, expiry):
         "scenario_desc": plain_english_status, 
         "support": sup, 
         "resistance": res, 
-        "s1": s1_val,  # Old EOS
-        "r1": r1_val,  # Old EOR
-        "s2": s2_val,  # New S-2 Boundary
-        "r2": r2_val,  # New R-2 Boundary
+        "s1": s1_val,  
+        "r1": r1_val,  
+        "s2": s2_val,  
+        "r2": r2_val,  
         "logs": mem['logs']
     }
+
 # ══════════════════════════════════════════════════════════
-#  🟢 AUTOMATED 9:15 to 3:30 RECORDER (MONGODB UPDATE)
-# ══════════════════════════════════════════════════════════def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
+#  🟢 AUTOMATED RECORDER & CRON ENGINE
+# ══════════════════════════════════════════════════════════
+def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
     if not chain_rows or not spot: return
     
     ts = datetime.utcnow() + timedelta(hours=5, minutes=30)
@@ -434,11 +413,57 @@ def calculate_coa(chain_rows, symbol, expiry):
             {"$set": snapshot},
             upsert=True
         )
-        print(f"💾 SAVED TO MONGO: {symbol} at {time_key}") # 🟢 NEW: Confirms actual DB save
+        print(f"💾 SAVED TO MONGO: {symbol} at {time_key}")
     except Exception as e:
         print(f"❌ MongoDB Record Error: {e}")
 
-def record_market_snapshot():
+def fetch_and_record(symbol):
+    cfg = SYMBOL_MAP.get(symbol)
+    if not cfg: return
+    
+    resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
+    data = resp.json().get("data") or []
+    expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
+    if not expiries: return
+    closest_expiry = expiries[0]
+
+    spot = None
+    spot_resp = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
+    if spot_resp.status_code == 200:
+        safe_spot = spot_resp.json().get("data") or {}
+        for v in safe_spot.values():
+            spot = v.get("last_price")
+            break
+            
+    chain_resp = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": cfg["instrument_key"], "expiry_date": closest_expiry}, headers=auth_headers())
+    raw_list = chain_resp.json().get("data") or []
+    if not raw_list: return
+    
+    if not spot: spot = float(raw_list[0].get("underlying_spot_price", 0))
+
+    chain_rows, total_ce_oi, total_pe_oi = [], 0, 0
+    for item in raw_list:
+        strike = int(float(item.get("strike_price", 0)))
+        def p_side(d):
+            md, og = d.get("market_data") or {}, d.get("option_greeks") or {}
+            raw_iv = float(og.get("iv") or 0)
+            return {
+                "ltp": md.get("ltp", 0), "oi": md.get("oi", 0), "volume": md.get("volume", 0),
+                "iv": raw_iv * 100 if 0 < raw_iv < 1.0 else raw_iv, 
+                "delta": og.get("delta", 0), "theta": og.get("theta", 0), "vega": og.get("vega", 0), "gamma": float(og.get("gamma") or 0.0005) * 10000
+            }
+        ce, pe = p_side(item.get("call_options") or {}), p_side(item.get("put_options") or {})
+        total_ce_oi += ce["oi"]
+        total_pe_oi += pe["oi"]
+        chain_rows.append({"strike": strike, "ce": ce, "pe": pe})
+        
+    pcr = round(total_pe_oi / max(total_ce_oi, 1), 2)
+    chain_rows = inject_prz(chain_rows, closest_expiry, cfg["step"], spot)
+    compress_and_save(symbol, closest_expiry, spot, pcr, chain_rows)
+
+@app.route("/cron/record", methods=['GET'])
+def trigger_record():
+    """This route is pinged every 60s by an external cron service"""
     ist = pytz.timezone('Asia/Kolkata')
     now = datetime.now(ist)
     
@@ -450,30 +475,28 @@ def record_market_snapshot():
     )
     
     global _access_token
-    
-    # 🟢 NEW: LOUD DIAGNOSTICS
-    print(f"⚙️ Engine Check [{now.strftime('%H:%M:%S')}]: Weekday={is_weekday}, Open={is_market_open}, Token={'YES' if _access_token else 'NO'}")
+    print(f"⚙️ CRON HIT [{now.strftime('%H:%M:%S')}]: Weekday={is_weekday}, Open={is_market_open}, Token={'YES' if _access_token else 'NO'}")
 
     if not _access_token:
         print("🛑 RECORDER BLOCKED: No Upstox token found! Please visit /login to authenticate.")
-        return
+        return jsonify({"status": "blocked", "reason": "no_token"}), 403
 
     if is_weekday and is_market_open:
         try:
             for sym in SYMBOL_MAP.keys():
                 fetch_and_record(sym)
             print(f"📸 Snapshots batch complete for {now.strftime('%H:%M:%S')} IST")
+            return jsonify({"status": "success", "message": f"Recorded all indices at {now.strftime('%H:%M:%S')} IST"})
         except Exception as e:
             print(f"❌ Failed to record market snapshot: {str(e)}")
-    elif not is_market_open:
-        print("💤 Market is closed. Engine sleeping.")
-
+            return jsonify({"status": "error", "message": str(e)}), 500
+    
+    print("💤 Market is closed. Engine sleeping.")
+    return jsonify({"status": "sleeping", "message": "Market Closed"}), 200
 
 # ══════════════════════════════════════════════════════════
 #  🟢 TERMINAL DATA ROUTES
 # ══════════════════════════════════════════════════════════
-def auth_headers(): return {"Authorization": f"Bearer {_access_token}", "Accept": "application/json"}
-
 @app.route("/health")
 def health(): return jsonify({"status": "ok", "authenticated": _access_token is not None})
 
@@ -613,7 +636,7 @@ def options_chain():
         pe = parse_side(item.get("put_options"))
         total_ce_oi += ce["oi"] or 0
         total_pe_oi += pe["oi"] or 0
-        chain_rows.append({"strike": strike, "atm": atm is not None and abs(strike - atm) < cfg["step"], "ce": ce, "pe": pe})
+        chain_rows.append({"strike": strike, "ce": ce, "pe": pe})
 
     chain_rows = inject_prz(chain_rows, expiry, cfg["step"], spot)
     coa_data = calculate_coa(chain_rows, symbol, expiry)
@@ -724,7 +747,6 @@ def user_profile():
         if updates:
             users_col.update_one({"_id": uid}, {"$set": updates})
 
-    # 🟢 BULLETPROOF EXPIRY CHECK 
     formatted_expiry = None
     if user_doc.get("tier") == "pro":
         raw_expiry = user_doc.get("expiry")
@@ -762,32 +784,54 @@ def user_profile():
 def create_order():
     data = request.json
     plan = data.get('plan') 
+    uid = request.user['uid']
     
-    prices = {"1_month": 24900, "3_months": 59900, "6_months": 99900}
-    amount = prices.get(plan)
+    prices_inr = {"1_month": 249, "3_months": 599, "6_months": 999}
+    base_price = prices_inr.get(plan)
     
-    if not amount: return jsonify({"error": "Invalid plan"}), 400
+    if not base_price: return jsonify({"error": "Invalid plan"}), 400
 
-    short_receipt = f"r_{int(time.time())}_{request.user['uid'][:5]}"
+    user_doc = users_col.find_one({"_id": uid})
+    wallet_bal = float(user_doc.get("wallet_balance", 0.0)) if user_doc else 0.0
+
+    payable_inr = max(0, base_price - wallet_bal)
+    wallet_used = min(wallet_bal, base_price)
+
+    if payable_inr == 0:
+        days_to_add = 30 if plan == "1_month" else 90 if plan == "3_months" else 180
+        new_expiry = datetime.now() + timedelta(days=days_to_add)
+        
+        users_col.update_one(
+            {"_id": uid}, 
+            {
+                "$set": {"tier": "pro", "expiry": new_expiry},
+                "$inc": {"wallet_balance": -wallet_used} 
+            }
+        )
+        return jsonify({"status": "instant_upgrade", "message": "Paid fully via wallet!"})
+
+    amount_paise = int(payable_inr * 100)
+    short_receipt = f"r_{int(time.time())}_{uid[:5]}"
 
     order_data = {
-        "amount": amount,
+        "amount": amount_paise,
         "currency": "INR",
         "receipt": short_receipt,
         "notes": { 
-            "uid": request.user['uid'],
-            "plan": plan
+            "uid": uid,
+            "plan": plan,
+            "wallet_used": wallet_used 
         }
     }
     
     try:
         order = rzp_client.order.create(data=order_data)
-        return jsonify({"order_id": order['id'], "amount": amount, "key": RZP_KEY_ID})
+        return jsonify({"order_id": order['id'], "amount": amount_paise, "key": RZP_KEY_ID})
     except Exception as e:
         print(f"RAZORPAY ERROR: {str(e)}") 
         return jsonify({"error": str(e)}), 500
 
-def process_upgrade_and_commission(uid, plan, payment_id):
+def process_upgrade_and_commission(uid, plan, payment_id, wallet_used=0.0):
     user_check = users_col.find_one({"_id": uid})
     if not user_check or payment_id in user_check.get("processed_payments", []):
         print(f"🔒 Payment {payment_id} already processed. Skipping to prevent double-billing.")
@@ -801,7 +845,8 @@ def process_upgrade_and_commission(uid, plan, payment_id):
         {"_id": uid}, 
         {
             "$set": {"tier": "pro", "expiry": new_expiry},
-            "$push": {"processed_payments": payment_id} 
+            "$push": {"processed_payments": payment_id},
+            "$inc": {"wallet_balance": -float(wallet_used)} 
         },
         return_document=ReturnDocument.AFTER
     )
@@ -835,8 +880,9 @@ def verify_payment():
         uid = request.user['uid']
         plan = data.get('plan')
         payment_id = data['razorpay_payment_id']
+        wallet_used = data.get('wallet_used', 0.0)
         
-        process_upgrade_and_commission(uid, plan, payment_id)
+        process_upgrade_and_commission(uid, plan, payment_id, wallet_used)
         return jsonify({"status": "success"})
         
     except razorpay.errors.SignatureVerificationError:
@@ -865,10 +911,11 @@ def razorpay_webhook():
         notes = payment_entity.get('notes', {})
         uid = notes.get('uid')
         plan = notes.get('plan')
+        wallet_used = float(notes.get('wallet_used', 0.0))
         
         if uid and plan:
             print(f"📡 WEBHOOK FIRED for UID {uid[:5]}...")
-            process_upgrade_and_commission(uid, plan, payment_id)
+            process_upgrade_and_commission(uid, plan, payment_id, wallet_used)
             
     return jsonify({"status": "ok"}), 200
 
@@ -913,130 +960,6 @@ def download_archive():
     except Exception as e:
         print(f"Archive Download Error: {e}")
         return jsonify({"error": "Failed to generate archive"}), 500
-        
-# ══════════════════════════════════════════════════════════
-#  🟢 THE EXTERNAL CRON ENGINE
-# ══════════════════════════════════════════════════════════
-def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
-    if not chain_rows or not spot: return
-    
-    ts = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    time_key = ts.strftime("%I:%M %p")
-    date_str = ts.strftime("%Y-%m-%d")
-
-    step = SYMBOL_MAP[symbol]["step"]
-    atm = round(spot / step) * step
-    
-    compressed_chain = []
-    for r in chain_rows:
-        if abs(r['strike'] - atm) <= (20 * step): 
-            compressed_chain.append([
-                r['strike'],
-                r['ce'].get('oi', 0),
-                r['ce'].get('volume', 0),
-                float(r['ce'].get('ltp', 0)),
-                r['pe'].get('oi', 0),
-                r['pe'].get('volume', 0),
-                float(r['pe'].get('ltp', 0))
-            ])
-
-    snapshot = {
-        "sym": symbol,
-        "exp": expiry,
-        "date": date_str,
-        "time_key": time_key,
-        "createdAt": datetime.utcnow(), 
-        "spot": spot,
-        "pcr": pcr,
-        "chain": compressed_chain
-    }
-
-    try:
-        history_col.update_one(
-            {"sym": symbol, "exp": expiry, "date": date_str, "time_key": time_key},
-            {"$set": snapshot},
-            upsert=True
-        )
-        print(f"💾 SAVED TO MONGO: {symbol} at {time_key}")
-    except Exception as e:
-        print(f"❌ MongoDB Record Error: {e}")
-
-def fetch_and_record(symbol):
-    cfg = SYMBOL_MAP.get(symbol)
-    if not cfg: return
-    
-    resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
-    data = resp.json().get("data") or []
-    expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
-    if not expiries: return
-    closest_expiry = expiries[0]
-
-    spot = None
-    spot_resp = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
-    if spot_resp.status_code == 200:
-        safe_spot = spot_resp.json().get("data") or {}
-        for v in safe_spot.values():
-            spot = v.get("last_price")
-            break
-            
-    chain_resp = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": cfg["instrument_key"], "expiry_date": closest_expiry}, headers=auth_headers())
-    raw_list = chain_resp.json().get("data") or []
-    if not raw_list: return
-    
-    if not spot: spot = float(raw_list[0].get("underlying_spot_price", 0))
-
-    chain_rows, total_ce_oi, total_pe_oi = [], 0, 0
-    for item in raw_list:
-        strike = int(float(item.get("strike_price", 0)))
-        def p_side(d):
-            md, og = d.get("market_data") or {}, d.get("option_greeks") or {}
-            raw_iv = float(og.get("iv") or 0)
-            return {
-                "ltp": md.get("ltp", 0), "oi": md.get("oi", 0), "volume": md.get("volume", 0),
-                "iv": raw_iv * 100 if 0 < raw_iv < 1.0 else raw_iv, 
-                "delta": og.get("delta", 0), "theta": og.get("theta", 0), "vega": og.get("vega", 0), "gamma": float(og.get("gamma") or 0.0005) * 10000
-            }
-        ce, pe = p_side(item.get("call_options") or {}), p_side(item.get("put_options") or {})
-        total_ce_oi += ce["oi"]
-        total_pe_oi += pe["oi"]
-        chain_rows.append({"strike": strike, "ce": ce, "pe": pe})
-        
-    pcr = round(total_pe_oi / max(total_ce_oi, 1), 2)
-    chain_rows = inject_prz(chain_rows, closest_expiry, cfg["step"], spot)
-    compress_and_save(symbol, closest_expiry, spot, pcr, chain_rows)
-
-@app.route("/cron/record", methods=['GET'])
-def trigger_record():
-    """This route is pinged every 60s by an external cron service"""
-    ist = pytz.timezone('Asia/Kolkata')
-    now = datetime.now(ist)
-    
-    is_weekday = now.weekday() < 5
-    is_market_open = (
-        (now.hour == 9 and now.minute >= 15) or 
-        (now.hour > 9 and now.hour < 15) or 
-        (now.hour == 15 and now.minute <= 30)
-    )
-    
-    global _access_token
-    print(f"⚙️ CRON HIT [{now.strftime('%H:%M:%S')}]: Weekday={is_weekday}, Open={is_market_open}, Token={'YES' if _access_token else 'NO'}")
-
-    if not _access_token:
-        print("🛑 RECORDER BLOCKED: No Upstox token found! Please visit /login to authenticate.")
-        return jsonify({"status": "blocked", "reason": "no_token"}), 403
-
-    if is_weekday and is_market_open:
-        try:
-            for sym in SYMBOL_MAP.keys():
-                fetch_and_record(sym)
-            print(f"📸 Snapshots batch complete for {now.strftime('%H:%M:%S')} IST")
-            return jsonify({"status": "success", "message": f"Recorded all indices at {now.strftime('%H:%M:%S')} IST"})
-        except Exception as e:
-            print(f"❌ Failed to record market snapshot: {str(e)}")
-            return jsonify({"status": "error", "message": str(e)}), 500
-    
-    print("💤 Market is closed. Engine sleeping.")
-    return jsonify({"status": "sleeping", "message": "Market Closed"}), 200
 
 # ══════════════════════════════════════════════════════════
 #  SERVER START
