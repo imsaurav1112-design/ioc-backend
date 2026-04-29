@@ -19,7 +19,6 @@ from scipy.optimize import brentq, fsolve
 from functools import wraps
 
 # 🟢 SCHEDULER IMPORTS
-from apscheduler.schedulers.background import BackgroundScheduler
 import pytz
 import atexit
 
