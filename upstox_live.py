@@ -91,42 +91,40 @@ def ensure_mcx_master():
                 name = row.get('name', '').upper()
                 tsym = row.get('tradingsymbol', '').upper()
                 
-                # 🟢 Safely catch CRUDE OIL and NATURALGAS
                 base = None
                 if 'CRUDE' in name or 'CRUDE' in tsym: base = 'CRUDEOIL'
                 elif 'NATGAS' in name or 'NATURALGAS' in name or 'NATGAS' in tsym: base = 'NATURALGAS'
                 else: continue
                 
-                # 🟢 Explicitly block MINI contracts
                 if 'MINI' in name or 'MINI' in tsym or tsym.startswith('CRUDEOILM') or tsym.startswith('NATGASM'):
                     continue
                     
                 exp_raw = row.get('expiry')
                 if not exp_raw: continue
                 
-                # 🟢 Absolute Date Normalization: Store EVERYTHING as YYYY-MM-DD
                 parsed_date = parse_upstox_date(exp_raw)
                 exp_iso = parsed_date.strftime("%Y-%m-%d")
                 
                 itype = row.get('instrument_type', '').upper()
                 key = row.get('instrument_key')
                 
-                # Capture Futures (Spot Price)
                 if 'FUT' in itype and 'OPT' not in itype:
                     futs.append({'base': base, 'key': key, 'date': parsed_date})
-                    
-                # Capture Options (Safely catch OPTFUT, OPTCOM, etc.)
                 elif 'OPT' in itype:
                     if base not in opts: opts[base] = {}
                     if exp_iso not in opts[base]: opts[base][exp_iso] = {'strikes': {}, 'date': parsed_date}
                     try:
                         strike = float(row.get('strike'))
-                        opt_type = row.get('option_type').upper() # CE or PE
+                        opt_type = row.get('option_type').upper() 
                         if strike not in opts[base][exp_iso]['strikes']: opts[base][exp_iso]['strikes'][strike] = {}
-                        opts[base][exp_iso]['strikes'][strike][opt_type] = key
+                        
+                        # 🟢 FIX: Store BOTH the key AND the tradingsymbol
+                        opts[base][exp_iso]['strikes'][strike][opt_type] = {
+                            'key': key,
+                            'tsym': tsym
+                        }
                     except: pass
                     
-        # Link every Option Expiry to the nearest Future Expiry for the Spot Price
         for base, exps in opts.items():
             base_futs = sorted([f for f in futs if f['base'] == base], key=lambda x: x['date'])
             for exp_str, data in exps.items():
@@ -136,22 +134,12 @@ def ensure_mcx_master():
         MCX_MASTER_DICT = opts
         LAST_MCX_FETCH_DATE = today
         print("✅ MCX Master Dictionary Cached Successfully.")
-        print(f"📊 Available Options Cache Dates (CRUDEOIL): {list(MCX_MASTER_DICT.get('CRUDEOIL', {}).keys())}")
-        print(f"📊 Available Options Cache Dates (NATURALGAS): {list(MCX_MASTER_DICT.get('NATURALGAS', {}).keys())}")
-        
     except Exception as e:
         print(f"❌ Failed to build MCX Dictionary: {e}")
 
 def fetch_custom_mcx_chain(base_name, expiry_str, headers):
     ensure_mcx_master()
-    
-    # Debugging logs to pinpoint exact mismatch
-    print(f"🔍 Requested Expiry: {expiry_str}")
-    cached_dates = list(MCX_MASTER_DICT.get(base_name, {}).keys())
-    print(f"🔍 Available Cache Dates for {base_name}: {cached_dates}")
-    
     if base_name not in MCX_MASTER_DICT or expiry_str not in MCX_MASTER_DICT[base_name]:
-        print(f"⚠️ Mismatch! {expiry_str} not found in {cached_dates}")
         return [], None
         
     data = MCX_MASTER_DICT[base_name][expiry_str]
@@ -168,26 +156,38 @@ def fetch_custom_mcx_chain(base_name, expiry_str, headers):
         
     keys_to_fetch = []
     for strike, types in opt_map.items():
-        if "CE" in types: keys_to_fetch.append(types["CE"])
-        if "PE" in types: keys_to_fetch.append(types["PE"])
+        if "CE" in types: keys_to_fetch.append(types["CE"]["key"])
+        if "PE" in types: keys_to_fetch.append(types["PE"]["key"])
         
     if not keys_to_fetch: return [], spot
     
     all_quotes = {}
     try:
-        # Split into batches of 50
         for i in range(0, len(keys_to_fetch), 50):
             batch = keys_to_fetch[i:i+50]
             r = requests.get(f"{BASE_URL}/market-quote/quotes", params={"instrument_key": ",".join(batch)}, headers=headers)
             if r.status_code == 200:
                 all_quotes.update(r.json().get("data", {}))
+            else:
+                print(f"❌ Upstox API Error: {r.status_code}")
     except Exception as e:
         print(f"MCX batch fetch error: {e}")
         
     raw_list = []
     for strike, types in opt_map.items():
-        ce_key, pe_key = types.get("CE"), types.get("PE")
-        cq, pq = all_quotes.get(ce_key, {}), all_quotes.get(pe_key, {})
+        ce_data = types.get("CE")
+        pe_data = types.get("PE")
+        
+        ce_key = ce_data["key"] if ce_data else None
+        pe_key = pe_data["key"] if pe_data else None
+        
+        # 🟢 FIX: Build the alternate format Upstox uses (MCX_FO:TRADINGSYMBOL)
+        ce_tsym = f"MCX_FO:{ce_data['tsym']}" if ce_data else None
+        pe_tsym = f"MCX_FO:{pe_data['tsym']}" if pe_data else None
+        
+        # 🟢 FIX: Check the Upstox response for BOTH formats safely
+        cq = all_quotes.get(ce_key) or all_quotes.get(ce_tsym) or {}
+        pq = all_quotes.get(pe_key) or all_quotes.get(pe_tsym) or {}
         
         if not cq and not pq: continue
         
