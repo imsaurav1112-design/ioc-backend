@@ -631,36 +631,48 @@ def load_saved_token():
     global _access_token
     try:
         token_doc = sys_col.find_one({"_id": "upstox_auth"})
-        if not token_doc: return False
+        if not token_doc: 
+            print("❌ No token document found in MongoDB.")
+            return False
         
         token = token_doc.get("access_token", "")
+        
+        # 🟢 FIX: Just check if token exists. Removed the strict date check
+        # that was killing valid tokens at midnight.
         if token:
-            try:
-                import base64
-                payload = token.split(".")[1]
-                payload += "=" * (4 - len(payload) % 4)
-                decoded = json.loads(base64.b64decode(payload))
-                if decoded.get("exp", 0) > datetime.now().timestamp():
-                    _access_token = token
-                    return True
-            except: pass
+            _access_token = token
+            print(f"✅ Token loaded into RAM from MongoDB.")
+            return True
             
-        if token_doc.get("date") != datetime.now().strftime("%Y-%m-%d"): return False
-        _access_token = token
-        return True
-    except: return False
+        return False
+    except Exception as e:
+        print(f"❌ Error loading token: {e}")
+        return False
 
 def save_token(token):
     global _access_token
+    
+    # 🟢 CRITICAL GUARDRAIL: Prevent overwriting the DB with an empty token
+    if not token or token == "None":
+        print("⚠️ save_token aborted: Attempted to save an empty or invalid token.")
+        return False
+
     _access_token = token
     try:
         sys_col.update_one(
             {"_id": "upstox_auth"},
-            {"$set": {"access_token": token, "date": datetime.now().strftime("%Y-%m-%d")}},
+            {"$set": {
+                "access_token": token, 
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }},
             upsert=True
         )
-    except: pass
-
+        print("💾 Token saved to MongoDB successfully.")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to save token to MongoDB: {e}")
+        return False
 @app.route("/login")
 def login_route():
     params = {"response_type": "code", "client_id": API_KEY, "redirect_uri": REDIRECT_URI}
@@ -1011,6 +1023,13 @@ def trigger_record():
     ist = pytz.timezone('Asia/Kolkata')
     now = datetime.now(ist)
     
+    global _access_token
+    
+    # 🟢 THE MAGICAL FIX: If the RAM is wiped, pull the token from MongoDB!
+    if not _access_token:
+        print("🔍 Token missing in RAM, attempting to load from MongoDB...")
+        load_saved_token()
+    
     is_weekday = now.weekday() < 5
     is_market_open = (
         (now.hour == 9 and now.minute >= 15) or 
@@ -1018,11 +1037,10 @@ def trigger_record():
         (now.hour == 15 and now.minute <= 30)
     )
     
-    global _access_token
     print(f"⚙️ CRON HIT [{now.strftime('%H:%M:%S')}]: Weekday={is_weekday}, Open={is_market_open}, Token={'YES' if _access_token else 'NO'}")
 
     if not _access_token:
-        print("🛑 RECORDER BLOCKED: No Upstox token found! Please visit /login to authenticate.")
+        print("🛑 RECORDER BLOCKED: No Upstox token found even after DB check! Manual login required at /login")
         return jsonify({"status": "blocked", "reason": "no_token"}), 403
 
     if is_weekday and is_market_open:
