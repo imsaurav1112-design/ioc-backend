@@ -42,14 +42,57 @@ BASE_URL   = "https://api.upstox.com/v2"
 _access_token = None
 
 SYMBOL_MAP = {
-    "NIFTY":      {"instrument_key": "NSE_INDEX|Nifty 50",            "lot": 65,  "step": 50},
+    "NIFTY":      {"instrument_key": "NSE_INDEX|Nifty 50",            "lot": 75,  "step": 50},
     "BANKNIFTY":  {"instrument_key": "NSE_INDEX|Nifty Bank",          "lot": 30,  "step": 100},
     "FINNIFTY":   {"instrument_key": "NSE_INDEX|Nifty Fin Service",   "lot": 40,  "step": 50},
-    "MIDCPNIFTY": {"instrument_key": "NSE_INDEX|Nifty Midcap Select", "lot": 50,  "step": 25},
+    "MIDCPNIFTY": {"instrument_key": "NSE_INDEX|Nifty Mid Select",    "lot": 50,  "step": 25}, 
     "SENSEX":     {"instrument_key": "BSE_INDEX|SENSEX",              "lot": 20,  "step": 100}, 
-    "CRUDEOIL":   {"instrument_key": "MCX_FO|CRUDEOIL",               "lot": 100, "step": 10},
-    "NATURALGAS": {"instrument_key": "MCX_FO|NATURALGAS",             "lot": 1250,"step": 5}
+    "BANKEX":     {"instrument_key": "BSE_INDEX|BANKEX",              "lot": 15,  "step": 100},
+    
+    # 🟢 COMMODITIES: Flagged for Dynamic Lookup
+    "CRUDEOIL":   {"instrument_key": "MCX_FO|CRUDEOIL",   "is_mcx": True, "lot": 100, "step": 10},
+    "NATURALGAS": {"instrument_key": "MCX_FO|NATURALGAS", "is_mcx": True, "lot": 1250,"step": 5}
 }
+
+import gzip, csv, io
+
+MCX_CACHE = {}
+
+def get_dynamic_mcx_key(commodity_name):
+    """Hunts the Upstox CSV for the current active Futures contract for MCX Options"""
+    global MCX_CACHE
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    
+    # Return from cache if we already found it today
+    if commodity_name in MCX_CACHE and MCX_CACHE[commodity_name]["date"] == today_str:
+        return MCX_CACHE[commodity_name]["key"]
+        
+    try:
+        url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
+        response = requests.get(url, timeout=10)
+        compressed_file = io.BytesIO(response.content)
+        decompressed_file = gzip.GzipFile(fileobj=compressed_file)
+        csv_reader = csv.reader(io.TextIOWrapper(decompressed_file, 'utf-8'))
+        
+        headers = next(csv_reader)
+        futures = []
+        for row in csv_reader:
+            # row[9] is instrument_type, row[11] is exchange, row[3] is name
+            if len(row) > 11 and row[11] == 'MCX' and row[9] == 'FUT' and commodity_name in row[3]:
+                futures.append({"key": row[0], "expiry": row[5]})
+                
+        if futures:
+            # Sort by expiry to find the closest active future
+            futures.sort(key=lambda x: x["expiry"])
+            best_key = futures[0]["key"]
+            MCX_CACHE[commodity_name] = {"key": best_key, "date": today_str}
+            print(f"🔥 MCX Dynamic Key Linked: {commodity_name} -> {best_key}")
+            return best_key
+            
+    except Exception as e:
+        print(f"❌ Failed to fetch MCX CSV: {e}")
+        
+    return f"MCX_FO|{commodity_name}" # Fallback
 
 # 🟢 FIREBASE ADMIN SETUP
 try:
@@ -496,7 +539,10 @@ def expiry_dates():
             return jsonify({"error": str(e)}), 500
     else:
         cfg = SYMBOL_MAP.get(symbol)
-        resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
+        # 🟢 THE FIX: Ask the Hunter for the key if it's a commodity
+        inst_key = get_dynamic_mcx_key(symbol) if cfg.get("is_mcx") else cfg["instrument_key"]
+        
+        resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": inst_key}, headers=auth_headers())
         data = resp.json().get("data") or []
         expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
         return jsonify({"symbol": symbol, "expiries": expiries})
@@ -578,11 +624,15 @@ def options_chain():
     expiry = request.args.get("expiry", "").strip()
     cfg = SYMBOL_MAP.get(symbol)
 
-    resp = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": cfg["instrument_key"], "expiry_date": expiry}, headers=auth_headers())
+    # 🟢 THE FIX
+    inst_key = get_dynamic_mcx_key(symbol) if cfg.get("is_mcx") else cfg["instrument_key"]
+
+    resp = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": inst_key, "expiry_date": expiry}, headers=auth_headers())
     raw_list = resp.json().get("data") or []
     if not raw_list: return jsonify({"error": "No data from Upstox"}), 502
 
-    spot_resp = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
+    spot_resp = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": inst_key}, headers=auth_headers())
+
     spot = None
     if spot_resp.status_code == 200:
         for v in (spot_resp.json().get("data") or {}).values():
@@ -979,46 +1029,49 @@ def fetch_and_record(symbol):
     cfg = SYMBOL_MAP.get(symbol)
     if not cfg: return
     
-    resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
-    data = resp.json().get("data") or []
-    expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
-    if not expiries: return
-    closest_expiry = expiries[0]
-
-    spot = None
-    spot_resp = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
-    if spot_resp.status_code == 200:
-        safe_spot = spot_resp.json().get("data") or {}
-        for v in safe_spot.values():
-            spot = v.get("last_price")
-            break
-            
-    chain_resp = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": cfg["instrument_key"], "expiry_date": closest_expiry}, headers=auth_headers())
-    raw_list = chain_resp.json().get("data") or []
-    if not raw_list: return
+    # 🟢 THE FIX: Use the dynamic hunter for Commodities, static key for Indices
+    inst_key = get_dynamic_mcx_key(symbol) if cfg.get("is_mcx") else cfg["instrument_key"]
     
-    if not spot: spot = float(raw_list[0].get("underlying_spot_price", 0))
-
-    chain_rows, total_ce_oi, total_pe_oi = [], 0, 0
-    for item in raw_list:
-        strike = int(float(item.get("strike_price", 0)))
-        def p_side(d):
-            md, og = d.get("market_data") or {}, d.get("option_greeks") or {}
-            raw_iv = float(og.get("iv") or 0)
-            return {
-                "ltp": md.get("ltp", 0), "oi": md.get("oi", 0), "volume": md.get("volume", 0),
-                "iv": raw_iv * 100 if 0 < raw_iv < 1.0 else raw_iv, 
-                "delta": og.get("delta", 0), "theta": og.get("theta", 0), "vega": og.get("vega", 0), "gamma": float(og.get("gamma") or 0.0005) * 10000
-            }
-        ce, pe = p_side(item.get("call_options") or {}), p_side(item.get("put_options") or {})
-        total_ce_oi += ce["oi"]
-        total_pe_oi += pe["oi"]
-        chain_rows.append({"strike": strike, "ce": ce, "pe": pe})
+    try:
+        # Get expiry
+        r = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": inst_key}, headers=auth_headers())
+        exp = r.json()["data"][0]["expiry"]
         
-    pcr = round(total_pe_oi / max(total_ce_oi, 1), 2)
-    chain_rows = inject_prz(chain_rows, closest_expiry, cfg["step"], spot)
-    compress_and_save(symbol, closest_expiry, spot, pcr, chain_rows)
-
+        # Get spot
+        r = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": inst_key}, headers=auth_headers())
+        spot = list(r.json()["data"].values())[0]["last_price"]
+        
+        # Get Chain
+        r = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": inst_key, "expiry_date": exp}, headers=auth_headers())
+        raw = r.json()["data"]
+        
+        rows, tce, tpe = [], 0, 0
+        for item in raw:
+            strike = int(float(item["strike_price"]))
+            ce_oi = item.get("call_options", {}).get("market_data", {}).get("oi", 0)
+            pe_oi = item.get("put_options", {}).get("market_data", {}).get("oi", 0)
+            tce += ce_oi; tpe += pe_oi
+            
+            rows.append({
+                "strike": strike, 
+                "ce": {
+                    "oi": ce_oi, 
+                    "volume": item.get("call_options", {}).get("market_data", {}).get("volume", 0), 
+                    "ltp": item.get("call_options", {}).get("market_data", {}).get("ltp", 0)
+                }, 
+                "pe": {
+                    "oi": pe_oi, 
+                    "volume": item.get("put_options", {}).get("market_data", {}).get("volume", 0), 
+                    "ltp": item.get("put_options", {}).get("market_data", {}).get("ltp", 0)
+                }
+            })
+        
+        pcr = round(tpe / max(1, tce), 2)
+        chain_rows = inject_prz(rows, exp, cfg["step"], spot)
+        compress_and_save(symbol, exp, spot, pcr, chain_rows)
+        
+    except Exception as e: 
+        print(f"Record Error {symbol}: {e}")
 @app.route("/cron/record", methods=['GET'])
 def trigger_record():
     """This route is pinged every 60s by an external cron service"""
