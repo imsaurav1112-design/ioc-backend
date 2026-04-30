@@ -510,7 +510,7 @@ def save_paper_trade():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
         
-        @app.route("/api/paper-trade/exit", methods=['POST', 'OPTIONS'])
+@app.route("/api/paper-trade/exit", methods=['POST', 'OPTIONS'])
 @require_firebase_auth
 def exit_paper_trade():
     if request.method == 'OPTIONS': return jsonify({"status": "ok"}), 200
@@ -718,3 +718,4 @@ if __name__ == "__main__":
     load_saved_token()
     print("\n Server Running\n" + "-" * 45)
     app.run(port=5001, debug=False)
+    
