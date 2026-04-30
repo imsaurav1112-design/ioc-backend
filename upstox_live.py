@@ -18,6 +18,7 @@ from scipy.stats import norm
 from scipy.optimize import brentq, fsolve
 from functools import wraps
 import pytz
+import gzip, csv, io
 
 # 🟢 CLOUD IMPORTS
 from pymongo import MongoClient
@@ -39,24 +40,65 @@ REDIRECT_URI = "https://ioc-backend-kq9x.onrender.com/callback"
 BASE_URL   = "https://api.upstox.com/v2"
 _access_token = None
 
-# 🟢 THE BULLETPROOF SYMBOL MAP
+# 🟢 SYMBOL MAP
 SYMBOL_MAP = {
     # NSE INDICES
     "NIFTY":      {"instrument_key": "NSE_INDEX|Nifty 50",            "lot": 75,  "step": 50},
     "BANKNIFTY":  {"instrument_key": "NSE_INDEX|Nifty Bank",          "lot": 15,  "step": 100}, 
     "FINNIFTY":   {"instrument_key": "NSE_INDEX|Nifty Fin Service",   "lot": 40,  "step": 50},
-    
-    # 🟢 The exact string Upstox requires for Midcap Select
-    "MIDCPNIFTY": {"instrument_key": "NSE_INDEX|Nifty Mid Select",    "lot": 50,  "step": 25}, 
+    "MIDCPNIFTY": {"instrument_key": "NSE_INDEX|NIFTY MID SELECT",    "lot": 50,  "step": 25}, # 🟢 Adjusted Midcap String
     
     # BSE INDICES
     "SENSEX":     {"instrument_key": "BSE_INDEX|SENSEX",              "lot": 20,  "step": 100}, 
     "BANKEX":     {"instrument_key": "BSE_INDEX|BANKEX",              "lot": 15,  "step": 100},
     
-    # 🟢 COMMODITIES: Moved from MCX_FO to NSE_COM based on deep scan
-    "CRUDEOIL":   {"instrument_key": "NSE_COM|CRUDEOIL",              "lot": 100, "step": 10},
-    "NATURALGAS": {"instrument_key": "NSE_COM|NATURALGAS",            "lot": 1250,"step": 5}
+    # 🟢 COMMODITIES: Flagged to trigger the Dynamic Hunter
+    "CRUDEOIL":   {"is_mcx": True, "base_name": "CRUDEOIL",   "lot": 100, "step": 10},
+    "NATURALGAS": {"is_mcx": True, "base_name": "NATURALGAS", "lot": 1250,"step": 5}
 }
+
+# 🟢 DYNAMIC FUTURES HUNTER FOR MCX
+MCX_CACHE = {}
+
+def get_dynamic_mcx_key(commodity_name):
+    """Hunts the Upstox CSV for the current active Futures contract for MCX Options"""
+    global MCX_CACHE
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    
+    # Return from cache if already found today
+    if commodity_name in MCX_CACHE and MCX_CACHE[commodity_name]["date"] == today_str:
+        return MCX_CACHE[commodity_name]["key"]
+        
+    try:
+        url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
+        response = requests.get(url, timeout=10)
+        compressed_file = io.BytesIO(response.content)
+        decompressed_file = gzip.GzipFile(fileobj=compressed_file)
+        csv_reader = csv.reader(io.TextIOWrapper(decompressed_file, 'utf-8'))
+        
+        headers = next(csv_reader)
+        futures = []
+        for row in csv_reader:
+            if len(row) < 12: continue
+            # We are looking for FUTCOM or FUT on MCX matching the exact base name (excluding MINI contracts)
+            if row[11] == 'MCX_FO' and ('FUT' in row[9] and 'OPT' not in row[9]) and commodity_name in row[3]:
+                if 'MINI' not in row[3].upper() and 'M' not in row[2]: 
+                    futures.append({"key": row[0], "expiry": row[5]})
+                
+        if futures:
+            # Sort by expiry to find the closest active future
+            futures.sort(key=lambda x: x["expiry"])
+            best_key = futures[0]["key"]
+            MCX_CACHE[commodity_name] = {"key": best_key, "date": today_str}
+            print(f"🔥 MCX Dynamic Key Linked: {commodity_name} -> {best_key}")
+            return best_key
+            
+    except Exception as e:
+        print(f"❌ Failed to fetch MCX CSV: {e}")
+        
+    # Fallback to a generic format if everything fails
+    return f"MCX_FO|{commodity_name}" 
+
 
 # 🟢 FIREBASE ADMIN SETUP
 try:
@@ -394,35 +436,6 @@ def calculate_coa(chain_rows, symbol, expiry):
 # ══════════════════════════════════════════════════════════
 #  🟢 TERMINAL DATA ROUTES
 # ══════════════════════════════════════════════════════════
-@app.route("/debug-keys")
-def debug_keys():
-    import gzip, csv, io, requests
-    try:
-        url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
-        response = requests.get(url, timeout=10)
-        compressed_file = io.BytesIO(response.content)
-        decompressed_file = gzip.GzipFile(fileobj=compressed_file)
-        csv_reader = csv.reader(io.TextIOWrapper(decompressed_file, 'utf-8'))
-        
-        headers = next(csv_reader)
-        midcap_matches = []
-        crude_matches = []
-        
-        for row in csv_reader:
-            if len(row) < 10: continue
-            if row[9] == 'INDEX' and 'MID' in row[3].upper():
-                midcap_matches.append({"key": row[0], "name": row[3], "symbol": row[2]})
-            if 'FUT' in row[9].upper() and 'CRUDEOIL' in row[3].upper():
-                crude_matches.append({"key": row[0], "name": row[3], "type": row[9], "expiry": row[5]})
-        
-        crude_matches.sort(key=lambda x: x["expiry"])
-        return jsonify({
-            "1_MIDCAP_INDEX_FOUND": midcap_matches[:5],
-            "2_CRUDE_FUTURES_FOUND": crude_matches[:5] 
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)})
-
 @app.route("/health")
 def health(): return jsonify({"status": "ok", "authenticated": _access_token is not None})
 
@@ -441,9 +454,13 @@ def expiry_dates():
             return jsonify({"symbol": symbol, "expiries": expiries})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
-    else: # 🟢 Indentation perfectly fixed here!
+    else:
         cfg = SYMBOL_MAP.get(symbol)
-        resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
+        
+        # 🟢 THE FIX: Ask the Hunter for the key if it's an MCX commodity
+        inst_key = get_dynamic_mcx_key(cfg["base_name"]) if cfg.get("is_mcx") else cfg["instrument_key"]
+        
+        resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": inst_key}, headers=auth_headers())
         data = resp.json().get("data") or []
         expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
         return jsonify({"symbol": symbol, "expiries": expiries})
@@ -524,11 +541,14 @@ def options_chain():
     expiry = request.args.get("expiry", "").strip()
     cfg = SYMBOL_MAP.get(symbol)
 
-    resp = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": cfg["instrument_key"], "expiry_date": expiry}, headers=auth_headers())
+    # 🟢 THE FIX: Ask the Hunter for the key if it's an MCX commodity
+    inst_key = get_dynamic_mcx_key(cfg["base_name"]) if cfg.get("is_mcx") else cfg["instrument_key"]
+
+    resp = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": inst_key, "expiry_date": expiry}, headers=auth_headers())
     raw_list = resp.json().get("data") or []
     if not raw_list: return jsonify({"error": "No data from Upstox"}), 502
 
-    spot_resp = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
+    spot_resp = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": inst_key}, headers=auth_headers())
 
     spot = None
     if spot_resp.status_code == 200:
@@ -833,10 +853,6 @@ def razorpay_webhook():
 # ══════════════════════════════════════════════════════════
 #  🛡️ ADMIN COMMAND CENTER ROUTES
 # ══════════════════════════════════════════════════════════
-import io
-import csv
-from flask import send_file
-
 @app.route("/api/admin/download-archive", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def download_archive():
@@ -866,6 +882,7 @@ def download_archive():
         mem_file.seek(0)
         
         filename = f"Options_Archive_{datetime.now().strftime('%Y_%m_%d')}.csv"
+        from flask import send_file
         return send_file(mem_file, mimetype='text/csv', as_attachment=True, download_name=filename)
         
     except Exception as e:
@@ -923,17 +940,17 @@ def fetch_and_record(symbol):
     cfg = SYMBOL_MAP.get(symbol)
     if not cfg: return
     
+    # 🟢 THE FIX: Use the dynamic MCX hunter for Commodities
+    inst_key = get_dynamic_mcx_key(cfg["base_name"]) if cfg.get("is_mcx") else cfg["instrument_key"]
+    
     try:
-        # Get expiry
-        r = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
+        r = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": inst_key}, headers=auth_headers())
         exp = r.json()["data"][0]["expiry"]
         
-        # Get spot
-        r = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
+        r = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": inst_key}, headers=auth_headers())
         spot = list(r.json()["data"].values())[0]["last_price"]
         
-        # Get Chain
-        r = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": cfg["instrument_key"], "expiry_date": exp}, headers=auth_headers())
+        r = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": inst_key, "expiry_date": exp}, headers=auth_headers())
         raw = r.json()["data"]
         
         rows, tce, tpe = [], 0, 0
@@ -964,19 +981,13 @@ def fetch_and_record(symbol):
     except Exception as e: 
         print(f"Record Error {symbol}: {e}")
 
-# (Blank line correctly placed before the route decorator)
 @app.route("/cron/record", methods=['GET'])
 def trigger_record():
-    """This route is pinged every 60s by an external cron service"""
     ist = pytz.timezone('Asia/Kolkata')
     now = datetime.now(ist)
     
     global _access_token
-    
-    # 🟢 THE MAGICAL FIX: If the RAM is wiped, pull the token from MongoDB!
-    if not _access_token:
-        print("🔍 Token missing in RAM, attempting to load from MongoDB...")
-        load_saved_token()
+    if not _access_token: load_saved_token()
     
     is_weekday = now.weekday() < 5
     is_market_open = (
@@ -985,23 +996,17 @@ def trigger_record():
         (now.hour == 15 and now.minute <= 30)
     )
     
-    print(f"⚙️ CRON HIT [{now.strftime('%H:%M:%S')}]: Weekday={is_weekday}, Open={is_market_open}, Token={'YES' if _access_token else 'NO'}")
-
     if not _access_token:
-        print("🛑 RECORDER BLOCKED: No Upstox token found even after DB check! Manual login required at /login")
         return jsonify({"status": "blocked", "reason": "no_token"}), 403
 
     if is_weekday and is_market_open:
         try:
             for sym in SYMBOL_MAP.keys():
                 fetch_and_record(sym)
-            print(f"📸 Snapshots batch complete for {now.strftime('%H:%M:%S')} IST")
             return jsonify({"status": "success", "message": f"Recorded all indices at {now.strftime('%H:%M:%S')} IST"})
         except Exception as e:
-            print(f"❌ Failed to record market snapshot: {str(e)}")
             return jsonify({"status": "error", "message": str(e)}), 500
     
-    print("💤 Market is closed. Engine sleeping.")
     return jsonify({"status": "sleeping", "message": "Market Closed"}), 200
 
 # ══════════════════════════════════════════════════════════
