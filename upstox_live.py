@@ -2,7 +2,6 @@
 InsiderOwl — Upstox Live Market Backend (Cloud Edition)
 ====================================================================
 Includes Split-Brain Routing to bypass Upstox MCX Option Chain limits.
-Properly handles Commodity Option vs Future Expiry Date offsets.
 Provides raw instrument_keys to the frontend for WebSocket live feed.
 """
 
@@ -55,21 +54,11 @@ MCX_MASTER_DICT = {}
 LAST_MCX_FETCH_DATE = None
 
 def parse_upstox_date(d_str):
-    """Robustly parses Upstox date strings into a Python date object."""
     if not d_str: return datetime.max.date()
-    # Normalize some common Upstox format quirks (e.g., removing extra spaces)
     d_str = d_str.strip()
-    
-    # Try all known Upstox formats
     for fmt in ('%d-%b-%Y', '%Y-%m-%d', '%d-%m-%Y', '%d-%b-%y', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%S.%fZ', '%d-%b-%Y %H:%M:%S'):
-        try: 
-            # If the format includes time, extract just the date
-            dt = datetime.strptime(d_str, fmt)
-            return dt.date()
-        except ValueError: 
-            pass
-            
-    print(f"⚠️ Warning: Could not parse date format: {d_str}")
+        try: return datetime.strptime(d_str, fmt).date()
+        except ValueError: pass
     return datetime.max.date()
 
 def ensure_mcx_master():
@@ -117,8 +106,6 @@ def ensure_mcx_master():
                         strike = float(row.get('strike'))
                         opt_type = row.get('option_type').upper() 
                         if strike not in opts[base][exp_iso]['strikes']: opts[base][exp_iso]['strikes'][strike] = {}
-                        
-                        # 🟢 FIX: Store BOTH the key AND the tradingsymbol
                         opts[base][exp_iso]['strikes'][strike][opt_type] = {
                             'key': key,
                             'tsym': tsym
@@ -168,8 +155,6 @@ def fetch_custom_mcx_chain(base_name, expiry_str, headers):
             r = requests.get(f"{BASE_URL}/market-quote/quotes", params={"instrument_key": ",".join(batch)}, headers=headers)
             if r.status_code == 200:
                 all_quotes.update(r.json().get("data", {}))
-            else:
-                print(f"❌ Upstox API Error: {r.status_code}")
     except Exception as e:
         print(f"MCX batch fetch error: {e}")
         
@@ -181,11 +166,9 @@ def fetch_custom_mcx_chain(base_name, expiry_str, headers):
         ce_key = ce_data["key"] if ce_data else None
         pe_key = pe_data["key"] if pe_data else None
         
-        # 🟢 FIX: Build the alternate format Upstox uses (MCX_FO:TRADINGSYMBOL)
         ce_tsym = f"MCX_FO:{ce_data['tsym']}" if ce_data else None
         pe_tsym = f"MCX_FO:{pe_data['tsym']}" if pe_data else None
         
-        # 🟢 FIX: Check the Upstox response for BOTH formats safely
         cq = all_quotes.get(ce_key) or all_quotes.get(ce_tsym) or {}
         pq = all_quotes.get(pe_key) or all_quotes.get(pe_tsym) or {}
         
@@ -460,18 +443,11 @@ def expiry_dates():
         valid_exps.sort(key=lambda x: MCX_MASTER_DICT[base][x]['date'])
         return jsonify({"symbol": symbol, "expiries": valid_exps})
     else:
+        # 🟢 REVERT: Pass dates EXACTLY as Upstox formats them to prevent breaking Indices
         resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
         data = resp.json().get("data") or []
         expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
-        
-        # Consistent Date Normalization for Native API too
-        iso_expiries = []
-        for e in expiries:
-            parsed = parse_upstox_date(e)
-            if parsed != datetime.max.date():
-                iso_expiries.append(parsed.strftime("%Y-%m-%d"))
-        
-        return jsonify({"symbol": symbol, "expiries": sorted(list(set(iso_expiries)))})
+        return jsonify({"symbol": symbol, "expiries": expiries})
 
 @app.route("/options-chain", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
@@ -604,8 +580,7 @@ def fetch_and_record(symbol):
             raw, spot = fetch_custom_mcx_chain(base, exp, auth_headers())
         else:
             r = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
-            exp_raw = r.json()["data"][0]["expiry"]
-            exp = parse_upstox_date(exp_raw).strftime("%Y-%m-%d")
+            exp = r.json()["data"][0]["expiry"]
             r = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
             spot = list(r.json()["data"].values())[0]["last_price"]
             r = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": cfg["instrument_key"], "expiry_date": exp}, headers=auth_headers())
