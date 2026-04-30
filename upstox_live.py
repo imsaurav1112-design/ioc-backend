@@ -55,10 +55,21 @@ MCX_MASTER_DICT = {}
 LAST_MCX_FETCH_DATE = None
 
 def parse_upstox_date(d_str):
-    # 🟢 FIX: Added 2-digit year format just in case Upstox changes it
-    for fmt in ('%d-%b-%Y', '%Y-%m-%d', '%d-%m-%Y', '%d-%b-%y'):
-        try: return datetime.strptime(d_str, fmt).date()
-        except ValueError: pass
+    """Robustly parses Upstox date strings into a Python date object."""
+    if not d_str: return datetime.max.date()
+    # Normalize some common Upstox format quirks (e.g., removing extra spaces)
+    d_str = d_str.strip()
+    
+    # Try all known Upstox formats
+    for fmt in ('%d-%b-%Y', '%Y-%m-%d', '%d-%m-%Y', '%d-%b-%y', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%S.%fZ', '%d-%b-%Y %H:%M:%S'):
+        try: 
+            # If the format includes time, extract just the date
+            dt = datetime.strptime(d_str, fmt)
+            return dt.date()
+        except ValueError: 
+            pass
+            
+    print(f"⚠️ Warning: Could not parse date format: {d_str}")
     return datetime.max.date()
 
 def ensure_mcx_master():
@@ -80,27 +91,31 @@ def ensure_mcx_master():
                 name = row.get('name', '').upper()
                 tsym = row.get('tradingsymbol', '').upper()
                 
+                # 🟢 Safely catch CRUDE OIL and NATURALGAS
                 base = None
                 if 'CRUDE' in name or 'CRUDE' in tsym: base = 'CRUDEOIL'
                 elif 'NATGAS' in name or 'NATURALGAS' in name or 'NATGAS' in tsym: base = 'NATURALGAS'
                 else: continue
                 
+                # 🟢 Explicitly block MINI contracts
                 if 'MINI' in name or 'MINI' in tsym or tsym.startswith('CRUDEOILM') or tsym.startswith('NATGASM'):
                     continue
                     
                 exp_raw = row.get('expiry')
                 if not exp_raw: continue
                 
-                # 🟢 FIX 1: Normalize ALL dates to YYYY-MM-DD immediately so it matches the frontend perfectly
+                # 🟢 Absolute Date Normalization: Store EVERYTHING as YYYY-MM-DD
                 parsed_date = parse_upstox_date(exp_raw)
                 exp_iso = parsed_date.strftime("%Y-%m-%d")
                 
                 itype = row.get('instrument_type', '').upper()
                 key = row.get('instrument_key')
                 
+                # Capture Futures (Spot Price)
                 if 'FUT' in itype and 'OPT' not in itype:
                     futs.append({'base': base, 'key': key, 'date': parsed_date})
-                # 🟢 FIX 2: Safely catch 'OPTCOM', 'OPTFUT', 'OPTENR', etc. 
+                    
+                # Capture Options (Safely catch OPTFUT, OPTCOM, etc.)
                 elif 'OPT' in itype:
                     if base not in opts: opts[base] = {}
                     if exp_iso not in opts[base]: opts[base][exp_iso] = {'strikes': {}, 'date': parsed_date}
@@ -121,11 +136,22 @@ def ensure_mcx_master():
         MCX_MASTER_DICT = opts
         LAST_MCX_FETCH_DATE = today
         print("✅ MCX Master Dictionary Cached Successfully.")
+        print(f"📊 Available Options Cache Dates (CRUDEOIL): {list(MCX_MASTER_DICT.get('CRUDEOIL', {}).keys())}")
+        print(f"📊 Available Options Cache Dates (NATURALGAS): {list(MCX_MASTER_DICT.get('NATURALGAS', {}).keys())}")
+        
     except Exception as e:
         print(f"❌ Failed to build MCX Dictionary: {e}")
+
 def fetch_custom_mcx_chain(base_name, expiry_str, headers):
     ensure_mcx_master()
+    
+    # Debugging logs to pinpoint exact mismatch
+    print(f"🔍 Requested Expiry: {expiry_str}")
+    cached_dates = list(MCX_MASTER_DICT.get(base_name, {}).keys())
+    print(f"🔍 Available Cache Dates for {base_name}: {cached_dates}")
+    
     if base_name not in MCX_MASTER_DICT or expiry_str not in MCX_MASTER_DICT[base_name]:
+        print(f"⚠️ Mismatch! {expiry_str} not found in {cached_dates}")
         return [], None
         
     data = MCX_MASTER_DICT[base_name][expiry_str]
@@ -147,9 +173,9 @@ def fetch_custom_mcx_chain(base_name, expiry_str, headers):
         
     if not keys_to_fetch: return [], spot
     
-    # 🟢 FIX 4: Safe Batch Fetching
     all_quotes = {}
     try:
+        # Split into batches of 50
         for i in range(0, len(keys_to_fetch), 50):
             batch = keys_to_fetch[i:i+50]
             r = requests.get(f"{BASE_URL}/market-quote/quotes", params={"instrument_key": ",".join(batch)}, headers=headers)
@@ -424,7 +450,6 @@ def expiry_dates():
             return jsonify({"symbol": symbol, "expiries": sorted(saved_expiries)})
         except Exception as e: return jsonify({"error": str(e)}), 500
 
-    # 🟢 SPLIT BRAIN: Route MCX vs Indices
     if cfg.get("is_mcx"):
         ensure_mcx_master()
         base = cfg["base_name"]
@@ -438,7 +463,15 @@ def expiry_dates():
         resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
         data = resp.json().get("data") or []
         expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
-        return jsonify({"symbol": symbol, "expiries": expiries})
+        
+        # Consistent Date Normalization for Native API too
+        iso_expiries = []
+        for e in expiries:
+            parsed = parse_upstox_date(e)
+            if parsed != datetime.max.date():
+                iso_expiries.append(parsed.strftime("%Y-%m-%d"))
+        
+        return jsonify({"symbol": symbol, "expiries": sorted(list(set(iso_expiries)))})
 
 @app.route("/options-chain", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
@@ -447,10 +480,9 @@ def options_chain():
     expiry = request.args.get("expiry", "").strip()
     cfg = SYMBOL_MAP.get(symbol)
 
-    # 🟢 SPLIT BRAIN: Custom MCX Builder vs Native API
     if cfg.get("is_mcx"):
         raw_list, spot = fetch_custom_mcx_chain(cfg["base_name"], expiry, auth_headers())
-        if not raw_list: return jsonify({"error": "No MCX options found for this expiry"}), 502
+        if not raw_list: return jsonify({"error": f"No MCX options found for {expiry}"}), 502
     else:
         resp = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": cfg["instrument_key"], "expiry_date": expiry}, headers=auth_headers())
         raw_list = resp.json().get("data") or []
@@ -473,7 +505,6 @@ def options_chain():
         def parse_side(d):
             if not d: return {"instrument_key": "", "ltp": 0, "oi": 0, "change_oi": 0, "volume": 0}
             md = d.get("market_data") or {}
-            # 🟢 RAW KEY EXPOSED FOR WEBSOCKET
             return {
                 "instrument_key": d.get("instrument_key", ""), 
                 "ltp": md.get("ltp", 0), 
@@ -560,7 +591,6 @@ def fetch_and_record(symbol):
     if not cfg: return
     
     try:
-        # 🟢 SPLIT-BRAIN CRON ENGINE
         if cfg.get("is_mcx"):
             ensure_mcx_master()
             base = cfg["base_name"]
@@ -574,7 +604,8 @@ def fetch_and_record(symbol):
             raw, spot = fetch_custom_mcx_chain(base, exp, auth_headers())
         else:
             r = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
-            exp = r.json()["data"][0]["expiry"]
+            exp_raw = r.json()["data"][0]["expiry"]
+            exp = parse_upstox_date(exp_raw).strftime("%Y-%m-%d")
             r = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
             spot = list(r.json()["data"].values())[0]["last_price"]
             r = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": cfg["instrument_key"], "expiry_date": exp}, headers=auth_headers())
@@ -666,7 +697,6 @@ def callback_route():
 @app.route("/user-profile", methods=['GET', 'OPTIONS'])
 @require_firebase_auth
 def user_profile():
-    # 🟢 FIXED: Ensures wallet_balance is always returned to prevent .toFixed() frontend crash
     return jsonify({"tier": "pro", "email": request.user.get('email', ''), "wallet_balance": 0.00})
 
 if __name__ == "__main__":
