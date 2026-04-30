@@ -509,6 +509,24 @@ def save_paper_trade():
         return jsonify({"status": "success"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+        
+        @app.route("/api/paper-trade/exit", methods=['POST', 'OPTIONS'])
+@require_firebase_auth
+def exit_paper_trade():
+    if request.method == 'OPTIONS': return jsonify({"status": "ok"}), 200
+    try:
+        data = request.json
+        trade_id = data.get("id")
+        exit_price = data.get("exit_price")
+        pnl = data.get("pnl")
+        
+        paper_trades_col.update_one(
+            {"id": trade_id, "user_email": request.user.get('email')},
+            {"$set": {"status": "Closed", "exit_price": exit_price, "final_pnl": pnl}}
+        )
+        return jsonify({"status": "success"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/cron/email-trades", methods=['GET'])
 def email_daily_trades():
@@ -516,8 +534,8 @@ def email_daily_trades():
     today_str = now.strftime("%Y-%m-%d")
     
     # ⚠️ EDIT THIS SECTION: Put your actual email and app password here ⚠️
-    SENDER_EMAIL = "your.email@gmail.com"
-    SENDER_APP_PASSWORD = "your_16_digit_app_password"
+    SENDER_EMAIL = "greekcalculator@gmail.com"
+    SENDER_APP_PASSWORD = "llax olgz jdlh nybl"
     
     try:
         all_trades = list(paper_trades_col.find({"date": today_str}))
