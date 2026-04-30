@@ -42,13 +42,10 @@ _access_token = None
 
 # 🟢 SYMBOL MAP
 SYMBOL_MAP = {
-    # NSE INDICES
     "NIFTY":      {"instrument_key": "NSE_INDEX|Nifty 50",            "lot": 75,  "step": 50},
     "BANKNIFTY":  {"instrument_key": "NSE_INDEX|Nifty Bank",          "lot": 15,  "step": 100}, 
     "FINNIFTY":   {"instrument_key": "NSE_INDEX|Nifty Fin Service",   "lot": 40,  "step": 50},
-    "MIDCPNIFTY": {"instrument_key": "NSE_INDEX|NIFTY MID SELECT",    "lot": 50,  "step": 25}, # 🟢 Adjusted Midcap String
-    
-    # BSE INDICES
+    "MIDCPNIFTY": {"instrument_key": "NSE_INDEX|Nifty Mid Select",    "lot": 50,  "step": 25}, 
     "SENSEX":     {"instrument_key": "BSE_INDEX|SENSEX",              "lot": 20,  "step": 100}, 
     "BANKEX":     {"instrument_key": "BSE_INDEX|BANKEX",              "lot": 15,  "step": 100},
     
@@ -56,49 +53,62 @@ SYMBOL_MAP = {
     "CRUDEOIL":   {"is_mcx": True, "base_name": "CRUDEOIL",   "lot": 100, "step": 10},
     "NATURALGAS": {"is_mcx": True, "base_name": "NATURALGAS", "lot": 1250,"step": 5}
 }
-
 # 🟢 DYNAMIC FUTURES HUNTER FOR MCX
+import gzip, csv, io
+from datetime import datetime
+
 MCX_CACHE = {}
 
+def parse_upstox_date(d_str):
+    for fmt in ('%d-%b-%Y', '%Y-%m-%d', '%d-%m-%Y'):
+        try: return datetime.strptime(d_str, fmt).date()
+        except ValueError: pass
+    return datetime.max.date()
+
 def get_dynamic_mcx_key(commodity_name):
-    """Hunts the Upstox CSV for the current active Futures contract for MCX Options"""
+    """Hunts the Upstox MCX.csv.gz for the current active Futures contract"""
     global MCX_CACHE
     today_str = datetime.now().strftime("%Y-%m-%d")
     
-    # Return from cache if already found today
     if commodity_name in MCX_CACHE and MCX_CACHE[commodity_name]["date"] == today_str:
         return MCX_CACHE[commodity_name]["key"]
         
     try:
-        url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
+        # 🟢 THE FIX: Using your exact URL from the offline script
+        url = "https://assets.upstox.com/market-quote/instruments/exchange/MCX.csv.gz"
         response = requests.get(url, timeout=10)
-        compressed_file = io.BytesIO(response.content)
-        decompressed_file = gzip.GzipFile(fileobj=compressed_file)
-        csv_reader = csv.reader(io.TextIOWrapper(decompressed_file, 'utf-8'))
         
-        headers = next(csv_reader)
-        futures = []
-        for row in csv_reader:
-            if len(row) < 12: continue
-            # We are looking for FUTCOM or FUT on MCX matching the exact base name (excluding MINI contracts)
-            if row[11] == 'MCX_FO' and ('FUT' in row[9] and 'OPT' not in row[9]) and commodity_name in row[3]:
-                if 'MINI' not in row[3].upper() and 'M' not in row[2]: 
-                    futures.append({"key": row[0], "expiry": row[5]})
-                
-        if futures:
-            # Sort by expiry to find the closest active future
-            futures.sort(key=lambda x: x["expiry"])
-            best_key = futures[0]["key"]
-            MCX_CACHE[commodity_name] = {"key": best_key, "date": today_str}
-            print(f"🔥 MCX Dynamic Key Linked: {commodity_name} -> {best_key}")
-            return best_key
+        with gzip.open(io.BytesIO(response.content), 'rt') as f:
+            reader = csv.DictReader(f)
+            future_contracts = []
             
+            for row in reader:
+                name = row.get('name', '').upper()
+                inst_type = row.get('instrument_type', '').upper()
+                
+                # Look for Futures matching the commodity (Ignore MINI contracts)
+                if 'FUT' in inst_type and commodity_name in name and 'MINI' not in name:
+                    exp_date = parse_upstox_date(row.get('expiry', ''))
+                    # Only add if it hasn't expired yet
+                    if exp_date >= datetime.now().date():
+                        future_contracts.append({
+                            'key': row.get('instrument_key'),
+                            'expiry_date': exp_date
+                        })
+            
+            if future_contracts:
+                # Sort by closest expiry date (just like your offline script)
+                future_contracts.sort(key=lambda x: x['expiry_date'])
+                best_key = future_contracts[0]['key']
+                
+                MCX_CACHE[commodity_name] = {"key": best_key, "date": today_str}
+                print(f"🔥 MCX Dynamic Key Linked: {commodity_name} -> {best_key}")
+                return best_key
+                
     except Exception as e:
         print(f"❌ Failed to fetch MCX CSV: {e}")
         
-    # Fallback to a generic format if everything fails
-    return f"MCX_FO|{commodity_name}" 
-
+    return f"MCX_FO|{commodity_name}" # Fallback
 
 # 🟢 FIREBASE ADMIN SETUP
 try:
