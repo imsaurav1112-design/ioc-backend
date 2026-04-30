@@ -562,10 +562,12 @@ def trigger_record():
     if not _access_token: load_saved_token()
     
     is_weekday = now.weekday() < 5
+    
+    # 🟢 FIXED: Market window restricted exactly to Equities (09:15 to 15:30)
     is_market_open = (
         (now.hour == 9 and now.minute >= 15) or 
-        (now.hour > 9 and now.hour < 23) or 
-        (now.hour == 23 and now.minute <= 30)
+        (now.hour > 9 and now.hour < 15) or 
+        (now.hour == 15 and now.minute <= 30)
     )
     
     if not _access_token:
