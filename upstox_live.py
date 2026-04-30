@@ -1,8 +1,9 @@
 """
 InsiderOwl — Upstox Live Market Backend (Cloud Edition)
 ====================================================================
-Includes Split-Brain Routing to bypass Upstox MCX Option Chain limits.
-Provides raw instrument_keys to the frontend for WebSocket live feed.
+Streamlined Core Indices Version.
+MCX and Midcap temporarily disabled. 
+Architecture remains intact for future expansion.
 """
 
 import os, sys, time, json, requests
@@ -35,20 +36,17 @@ REDIRECT_URI = "https://ioc-backend-kq9x.onrender.com/callback"
 BASE_URL     = "https://api.upstox.com/v2"
 _access_token = None
 
-# 🟢 SYMBOL MAP
+# 🟢 SYMBOL MAP (Streamlined to Core 5 Indices)
 SYMBOL_MAP = {
     "NIFTY":      {"instrument_key": "NSE_INDEX|Nifty 50",            "lot": 75,  "step": 50},
     "BANKNIFTY":  {"instrument_key": "NSE_INDEX|Nifty Bank",          "lot": 15,  "step": 100}, 
     "FINNIFTY":   {"instrument_key": "NSE_INDEX|Nifty Fin Service",   "lot": 40,  "step": 50},
-    "MIDCPNIFTY": {"instrument_key": "NSE_INDEX|288009",              "lot": 50,  "step": 25}, 
     "SENSEX":     {"instrument_key": "BSE_INDEX|SENSEX",              "lot": 20,  "step": 100}, 
-    "BANKEX":     {"instrument_key": "BSE_INDEX|BANKEX",              "lot": 15,  "step": 100},
-    "CRUDEOIL":   {"is_mcx": True, "base_name": "CRUDEOIL",   "lot": 100, "step": 10},
-    "NATURALGAS": {"is_mcx": True, "base_name": "NATURALGAS", "lot": 1250,"step": 5}
+    "BANKEX":     {"instrument_key": "BSE_INDEX|BANKEX",              "lot": 15,  "step": 100}
 }
 
 # ══════════════════════════════════════════════════════════
-#  🟢 DYNAMIC MCX CUSTOM CHAIN BUILDER
+#  🟢 DYNAMIC MCX CUSTOM CHAIN BUILDER (Dormant for now)
 # ══════════════════════════════════════════════════════════
 MCX_MASTER_DICT = {}
 LAST_MCX_FETCH_DATE = None
@@ -62,131 +60,82 @@ def parse_upstox_date(d_str):
     return datetime.max.date()
 
 def ensure_mcx_master():
-    """Builds a database pairing Option Expiries with the nearest Future Expiry"""
     global MCX_MASTER_DICT, LAST_MCX_FETCH_DATE
     today = datetime.now().strftime("%Y-%m-%d")
     if LAST_MCX_FETCH_DATE == today and MCX_MASTER_DICT: return
-    
     try:
         url = "https://assets.upstox.com/market-quote/instruments/exchange/MCX.csv.gz"
         response = requests.get(url, timeout=15)
-        
         with gzip.open(io.BytesIO(response.content), 'rt') as f:
             reader = csv.DictReader(f)
-            futs = []
-            opts = {}
-            
+            futs, opts = [], {}
             for row in reader:
-                name = row.get('name', '').upper()
-                tsym = row.get('tradingsymbol', '').upper()
-                
+                name, tsym = row.get('name', '').upper(), row.get('tradingsymbol', '').upper()
                 base = None
                 if 'CRUDE' in name or 'CRUDE' in tsym: base = 'CRUDEOIL'
                 elif 'NATGAS' in name or 'NATURALGAS' in name or 'NATGAS' in tsym: base = 'NATURALGAS'
                 else: continue
-                
-                if 'MINI' in name or 'MINI' in tsym or tsym.startswith('CRUDEOILM') or tsym.startswith('NATGASM'):
-                    continue
-                    
+                if 'MINI' in name or 'MINI' in tsym or tsym.startswith('CRUDEOILM') or tsym.startswith('NATGASM'): continue
                 exp_raw = row.get('expiry')
                 if not exp_raw: continue
-                
                 parsed_date = parse_upstox_date(exp_raw)
                 exp_iso = parsed_date.strftime("%Y-%m-%d")
-                
-                itype = row.get('instrument_type', '').upper()
-                key = row.get('instrument_key')
-                
+                itype, key = row.get('instrument_type', '').upper(), row.get('instrument_key')
                 if 'FUT' in itype and 'OPT' not in itype:
                     futs.append({'base': base, 'key': key, 'date': parsed_date})
                 elif 'OPT' in itype:
                     if base not in opts: opts[base] = {}
                     if exp_iso not in opts[base]: opts[base][exp_iso] = {'strikes': {}, 'date': parsed_date}
                     try:
-                        strike = float(row.get('strike'))
-                        opt_type = row.get('option_type').upper() 
+                        strike, opt_type = float(row.get('strike')), row.get('option_type').upper() 
                         if strike not in opts[base][exp_iso]['strikes']: opts[base][exp_iso]['strikes'][strike] = {}
-                        opts[base][exp_iso]['strikes'][strike][opt_type] = {
-                            'key': key,
-                            'tsym': tsym
-                        }
+                        opts[base][exp_iso]['strikes'][strike][opt_type] = {'key': key, 'tsym': tsym}
                     except: pass
-                    
         for base, exps in opts.items():
             base_futs = sorted([f for f in futs if f['base'] == base], key=lambda x: x['date'])
             for exp_str, data in exps.items():
                 valid_futs = [f for f in base_futs if f['date'] >= data['date']]
                 data['fut_key'] = valid_futs[0]['key'] if valid_futs else None
-                
         MCX_MASTER_DICT = opts
         LAST_MCX_FETCH_DATE = today
-        print("✅ MCX Master Dictionary Cached Successfully.")
-    except Exception as e:
-        print(f"❌ Failed to build MCX Dictionary: {e}")
+    except Exception as e: pass
 
 def fetch_custom_mcx_chain(base_name, expiry_str, headers):
     ensure_mcx_master()
-    if base_name not in MCX_MASTER_DICT or expiry_str not in MCX_MASTER_DICT[base_name]:
-        return [], None
-        
+    if base_name not in MCX_MASTER_DICT or expiry_str not in MCX_MASTER_DICT[base_name]: return [], None
     data = MCX_MASTER_DICT[base_name][expiry_str]
-    fut_key = data.get("fut_key")
-    opt_map = data.get("strikes", {})
-    
+    fut_key, opt_map = data.get("fut_key"), data.get("strikes", {})
     spot = None
     if fut_key:
         try:
             r = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": fut_key}, headers=headers)
-            if r.status_code == 200:
-                spot = list(r.json().get("data", {}).values())[0].get("last_price")
+            if r.status_code == 200: spot = list(r.json().get("data", {}).values())[0].get("last_price")
         except: pass
-        
     keys_to_fetch = []
     for strike, types in opt_map.items():
         if "CE" in types: keys_to_fetch.append(types["CE"]["key"])
         if "PE" in types: keys_to_fetch.append(types["PE"]["key"])
-        
     if not keys_to_fetch: return [], spot
-    
     all_quotes = {}
     try:
         for i in range(0, len(keys_to_fetch), 50):
             batch = keys_to_fetch[i:i+50]
             r = requests.get(f"{BASE_URL}/market-quote/quotes", params={"instrument_key": ",".join(batch)}, headers=headers)
-            if r.status_code == 200:
-                all_quotes.update(r.json().get("data", {}))
-    except Exception as e:
-        print(f"MCX batch fetch error: {e}")
-        
+            if r.status_code == 200: all_quotes.update(r.json().get("data", {}))
+    except Exception as e: pass
     raw_list = []
     for strike, types in opt_map.items():
-        ce_data = types.get("CE")
-        pe_data = types.get("PE")
-        
-        ce_key = ce_data["key"] if ce_data else None
-        pe_key = pe_data["key"] if pe_data else None
-        
-        ce_tsym = f"MCX_FO:{ce_data['tsym']}" if ce_data else None
-        pe_tsym = f"MCX_FO:{pe_data['tsym']}" if pe_data else None
-        
+        ce_data, pe_data = types.get("CE"), types.get("PE")
+        ce_key, pe_key = ce_data["key"] if ce_data else None, pe_data["key"] if pe_data else None
+        ce_tsym, pe_tsym = f"MCX_FO:{ce_data['tsym']}" if ce_data else None, f"MCX_FO:{pe_data['tsym']}" if pe_data else None
         cq = all_quotes.get(ce_key) or all_quotes.get(ce_tsym) or {}
         pq = all_quotes.get(pe_key) or all_quotes.get(pe_tsym) or {}
-        
         if not cq and not pq: continue
-        
         raw_list.append({
-            "strike_price": float(strike),
-            "underlying_spot_price": spot or 0,
-            "call_options": {
-                "instrument_key": ce_key or "",
-                "market_data": {"ltp": cq.get("last_price", 0), "oi": cq.get("open_interest", 0), "volume": cq.get("volume", 0), "prev_oi": 0}
-            } if cq else None,
-            "put_options": {
-                "instrument_key": pe_key or "",
-                "market_data": {"ltp": pq.get("last_price", 0), "oi": pq.get("open_interest", 0), "volume": pq.get("volume", 0), "prev_oi": 0}
-            } if pq else None
+            "strike_price": float(strike), "underlying_spot_price": spot or 0,
+            "call_options": {"instrument_key": ce_key or "", "market_data": {"ltp": cq.get("last_price", 0), "oi": cq.get("open_interest", 0), "volume": cq.get("volume", 0), "prev_oi": 0}} if cq else None,
+            "put_options": {"instrument_key": pe_key or "", "market_data": {"ltp": pq.get("last_price", 0), "oi": pq.get("open_interest", 0), "volume": pq.get("volume", 0), "prev_oi": 0}} if pq else None
         })
-        
     return raw_list, spot
 
 # ══════════════════════════════════════════════════════════
@@ -443,7 +392,7 @@ def expiry_dates():
         valid_exps.sort(key=lambda x: MCX_MASTER_DICT[base][x]['date'])
         return jsonify({"symbol": symbol, "expiries": valid_exps})
     else:
-        # 🟢 REVERT: Pass dates EXACTLY as Upstox formats them to prevent breaking Indices
+        # Reverted back to the original stable logic for Equities/Indices
         resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
         data = resp.json().get("data") or []
         expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
