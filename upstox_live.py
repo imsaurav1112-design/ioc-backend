@@ -2,8 +2,7 @@
 InsiderOwl — Upstox Live Market Backend (Cloud Edition)
 ====================================================================
 Streamlined Core Indices Version.
-MCX and Midcap temporarily disabled. 
-Architecture remains intact for future expansion.
+IST Timezone completely enforced across all routes.
 """
 
 import os, sys, time, json, requests
@@ -36,6 +35,10 @@ REDIRECT_URI = "https://ioc-backend-kq9x.onrender.com/callback"
 BASE_URL     = "https://api.upstox.com/v2"
 _access_token = None
 
+# 🟢 HELPER: Force IST Time Everywhere
+def get_ist_now():
+    return datetime.utcnow() + timedelta(hours=5, minutes=30)
+
 # 🟢 SYMBOL MAP (Streamlined to Core 5 Indices)
 SYMBOL_MAP = {
     "NIFTY":      {"instrument_key": "NSE_INDEX|Nifty 50",            "lot": 75,  "step": 50},
@@ -61,7 +64,7 @@ def parse_upstox_date(d_str):
 
 def ensure_mcx_master():
     global MCX_MASTER_DICT, LAST_MCX_FETCH_DATE
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = get_ist_now().strftime("%Y-%m-%d")
     if LAST_MCX_FETCH_DATE == today and MCX_MASTER_DICT: return
     try:
         url = "https://assets.upstox.com/market-quote/instruments/exchange/MCX.csv.gz"
@@ -245,7 +248,7 @@ def calibrate_live_interest_rate(spot_price, atm_strike, days_to_expiry, atm_ce_
 def inject_prz(chain_rows, expiry_date_str, step, spot_price):
     try:
         exp_date = datetime.strptime(f"{expiry_date_str} 15:30:00", "%Y-%m-%d %H:%M:%S")
-        days_to_expiry = max(0.001, (exp_date - datetime.now()).total_seconds() / 86400.0)
+        days_to_expiry = max(0.001, (exp_date - get_ist_now()).total_seconds() / 86400.0)
     except: days_to_expiry = 5.0
 
     T = max(0.001, days_to_expiry / 365.0)
@@ -387,12 +390,11 @@ def expiry_dates():
         base = cfg["base_name"]
         valid_exps = []
         for e, data in MCX_MASTER_DICT.get(base, {}).items():
-            if data['date'] >= datetime.now().date():
+            if data['date'] >= get_ist_now().date():
                 valid_exps.append(e)
         valid_exps.sort(key=lambda x: MCX_MASTER_DICT[base][x]['date'])
         return jsonify({"symbol": symbol, "expiries": valid_exps})
     else:
-        # Reverted back to the original stable logic for Equities/Indices
         resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
         data = resp.json().get("data") or []
         expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
@@ -450,7 +452,7 @@ def options_chain():
     return jsonify({
         "symbol": symbol, "expiry": expiry, "spot": spot, "pcr": round(total_pe_oi / max(total_ce_oi, 1), 2),
         "total_ce_oi": total_ce_oi, "total_pe_oi": total_pe_oi, "lot_size": cfg["lot"],
-        "chain": chain_rows, "fetched_at": datetime.now().strftime("%H:%M:%S"), "coa": coa_data
+        "chain": chain_rows, "fetched_at": get_ist_now().strftime("%H:%M:%S"), "coa": coa_data
     })
 
 @app.route("/api/intraday-history", methods=['GET', 'OPTIONS'], strict_slashes=False)
@@ -458,7 +460,7 @@ def options_chain():
 def intraday_history():
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
     expiry = request.args.get("expiry", "").strip()
-    target_date = request.args.get("date", (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")).strip()
+    target_date = request.args.get("date", get_ist_now().strftime("%Y-%m-%d")).strip()
     try:
         cursor = history_col.find({"sym": symbol, "exp": expiry, "date": target_date}).sort("createdAt", 1)
         records = list(cursor)
@@ -486,7 +488,7 @@ def intraday_history():
 # ══════════════════════════════════════════════════════════
 def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
     if not chain_rows or not spot: return
-    ts = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    ts = get_ist_now()
     time_key = ts.strftime("%I:%M %p")
     date_str = ts.strftime("%Y-%m-%d")
 
@@ -521,7 +523,7 @@ def fetch_and_record(symbol):
             base = cfg["base_name"]
             valid_exps = []
             for e, data in MCX_MASTER_DICT.get(base, {}).items():
-                if data['date'] >= datetime.now().date():
+                if data['date'] >= get_ist_now().date():
                     valid_exps.append(e)
             if not valid_exps: return
             valid_exps.sort(key=lambda x: MCX_MASTER_DICT[base][x]['date'])
@@ -555,15 +557,12 @@ def fetch_and_record(symbol):
 
 @app.route("/cron/record", methods=['GET'])
 def trigger_record():
-    ist = pytz.timezone('Asia/Kolkata')
-    now = datetime.now(ist)
+    now = get_ist_now()
     
     global _access_token
     if not _access_token: load_saved_token()
     
     is_weekday = now.weekday() < 5
-    
-    # 🟢 FIXED: Market window restricted exactly to Equities (09:15 to 15:30)
     is_market_open = (
         (now.hour == 9 and now.minute >= 15) or 
         (now.hour > 9 and now.hour < 15) or 
@@ -581,7 +580,7 @@ def trigger_record():
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
     
-    return jsonify({"status": "sleeping", "message": "Market Closed"}), 200
+    return jsonify({"status": "sleeping", "message": f"Market Closed (Server Time: {now.strftime('%H:%M:%S')} IST)"}), 200
 
 # ══════════════════════════════════════════════════════════
 #  🟢 SERVER AUTH & USER MANAGEMENT
@@ -601,7 +600,7 @@ def save_token(token):
     if not token or token == "None": return False
     _access_token = token
     try:
-        sys_col.update_one({"_id": "upstox_auth"}, {"$set": {"access_token": token, "date": datetime.now().strftime("%Y-%m-%d")}}, upsert=True)
+        sys_col.update_one({"_id": "upstox_auth"}, {"$set": {"access_token": token, "date": get_ist_now().strftime("%Y-%m-%d")}}, upsert=True)
         return True
     except: return False
 
