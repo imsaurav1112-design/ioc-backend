@@ -7,7 +7,7 @@ Includes Split-Brain Routing for native Equities vs Custom MCX Option Chains.
 import os, sys, time, json, requests
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, requestf
 from flask_cors import CORS
 import numpy as np
 from scipy.stats import norm
@@ -36,15 +36,13 @@ _access_token = None
 #  🟢 SYMBOL MAP
 # ══════════════════════════════════════════════════════════
 SYMBOL_MAP = {
-    # NSE / BSE INDICES (Native Option Chain API)
     "NIFTY":      {"instrument_key": "NSE_INDEX|Nifty 50",            "lot": 75,  "step": 50},
     "BANKNIFTY":  {"instrument_key": "NSE_INDEX|Nifty Bank",          "lot": 15,  "step": 100}, 
     "FINNIFTY":   {"instrument_key": "NSE_INDEX|Nifty Fin Service",   "lot": 40,  "step": 50},
+    # 🟢 Stable string for Midcap Select
     "MIDCPNIFTY": {"instrument_key": "NSE_INDEX|Nifty Mid Select",    "lot": 50,  "step": 25}, 
     "SENSEX":     {"instrument_key": "BSE_INDEX|SENSEX",              "lot": 20,  "step": 100}, 
     "BANKEX":     {"instrument_key": "BSE_INDEX|BANKEX",              "lot": 15,  "step": 100},
-    
-    # 🟢 COMMODITIES (Custom Quotes API Chain Builder)
     "CRUDEOIL":   {"is_mcx": True, "base_name": "CRUDEOIL",   "lot": 100, "step": 10},
     "NATURALGAS": {"is_mcx": True, "base_name": "NATURALGAS", "lot": 1250,"step": 5}
 }
@@ -72,8 +70,7 @@ def ensure_mcx_master():
             
             for row in reader:
                 name = row.get('name', '').upper()
-                if 'MINI' in name: continue 
-                
+                # 🟢 Match both NATURALGAS and NATGAS
                 base = None
                 if 'CRUDEOIL' in name: base = 'CRUDEOIL'
                 elif 'NATURALGAS' in name or 'NATGAS' in name: base = 'NATURALGAS'
@@ -88,17 +85,19 @@ def ensure_mcx_master():
                 if base not in new_dict: new_dict[base] = {}
                 if exp not in new_dict[base]: new_dict[base][exp] = {"FUT": None, "OPT": {}}
                 
-                if 'FUT' in itype and 'OPT' not in itype:
-                    new_dict[base][exp]["FUT"] = key
+                # Check for Futures or Options
+                if itype in ['FUTCOM', 'FUTENR', 'FUT']:
+                    # Prioritize main contracts over MINI for the "Spot" price
+                    if 'MINI' not in name:
+                        new_dict[base][exp]["FUT"] = key
                 elif itype == 'OPTFUT':
                     try:
                         strike = float(row.get('strike'))
-                        opt_type = row.get('option_type') # CE or PE
+                        opt_type = row.get('option_type')
                         if strike not in new_dict[base][exp]["OPT"]:
                             new_dict[base][exp]["OPT"][strike] = {}
                         new_dict[base][exp]["OPT"][strike][opt_type] = key
-                    except: pass
-            
+                    except: pass            
         MCX_MASTER_DICT = new_dict
         LAST_MCX_FETCH_DATE = today
         print("✅ MCX Master Dictionary Cached Successfully.")
