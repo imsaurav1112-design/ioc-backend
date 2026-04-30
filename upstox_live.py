@@ -17,10 +17,7 @@ import numpy as np
 from scipy.stats import norm
 from scipy.optimize import brentq, fsolve
 from functools import wraps
-
-# 🟢 SCHEDULER IMPORTS
 import pytz
-import atexit
 
 # 🟢 CLOUD IMPORTS
 from pymongo import MongoClient
@@ -29,7 +26,8 @@ from firebase_admin import credentials, auth
 import razorpay
 
 app = Flask(__name__)
-CORS(app)
+# Allow cross-origin requests
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 # ══════════════════════════════════════════════════════════
 #  🔑 CONFIGURATION & CLOUD SETUP
@@ -45,7 +43,7 @@ _access_token = None
 SYMBOL_MAP = {
     # NSE INDICES
     "NIFTY":      {"instrument_key": "NSE_INDEX|Nifty 50",            "lot": 75,  "step": 50},
-    "BANKNIFTY":  {"instrument_key": "NSE_INDEX|Nifty Bank",          "lot": 30,  "step": 100}, # Update to 15 if your broker switched
+    "BANKNIFTY":  {"instrument_key": "NSE_INDEX|Nifty Bank",          "lot": 15,  "step": 100}, 
     "FINNIFTY":   {"instrument_key": "NSE_INDEX|Nifty Fin Service",   "lot": 40,  "step": 50},
     
     # 🟢 The exact string Upstox requires for Midcap Select
@@ -59,46 +57,6 @@ SYMBOL_MAP = {
     "CRUDEOIL":   {"instrument_key": "NSE_COM|CRUDEOIL",              "lot": 100, "step": 10},
     "NATURALGAS": {"instrument_key": "NSE_COM|NATURALGAS",            "lot": 1250,"step": 5}
 }
-
-import gzip, csv, io
-
-MCX_CACHE = {}
-
-def get_dynamic_mcx_key(commodity_name):
-    """Hunts the Upstox CSV for the current active Futures contract for MCX Options"""
-    global MCX_CACHE
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    
-    # Return from cache if we already found it today
-    if commodity_name in MCX_CACHE and MCX_CACHE[commodity_name]["date"] == today_str:
-        return MCX_CACHE[commodity_name]["key"]
-        
-    try:
-        url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
-        response = requests.get(url, timeout=10)
-        compressed_file = io.BytesIO(response.content)
-        decompressed_file = gzip.GzipFile(fileobj=compressed_file)
-        csv_reader = csv.reader(io.TextIOWrapper(decompressed_file, 'utf-8'))
-        
-        headers = next(csv_reader)
-        futures = []
-        for row in csv_reader:
-            # row[9] is instrument_type, row[11] is exchange, row[3] is name
-            if len(row) > 11 and row[11] == 'MCX' and row[9] == 'FUT' and commodity_name in row[3]:
-                futures.append({"key": row[0], "expiry": row[5]})
-                
-        if futures:
-            # Sort by expiry to find the closest active future
-            futures.sort(key=lambda x: x["expiry"])
-            best_key = futures[0]["key"]
-            MCX_CACHE[commodity_name] = {"key": best_key, "date": today_str}
-            print(f"🔥 MCX Dynamic Key Linked: {commodity_name} -> {best_key}")
-            return best_key
-            
-    except Exception as e:
-        print(f"❌ Failed to fetch MCX CSV: {e}")
-        
-    return f"MCX_FO|{commodity_name}" # Fallback
 
 # 🟢 FIREBASE ADMIN SETUP
 try:
@@ -158,6 +116,9 @@ def require_firebase_auth(f):
             
         return f(*args, **kwargs)
     return decorated_function
+
+def auth_headers(): 
+    return {"Authorization": f"Bearer {_access_token}", "Accept": "application/json"}
 
 # ══════════════════════════════════════════════════════════
 #  🟢 INSTITUTIONAL BLACK-SCHOLES SEESAW & GREEKS ENGINE
@@ -303,7 +264,7 @@ def evaluate_side(vols_dict, mem_side, side_name):
         sec_strike, sec_vol = sorted_vols[1]
         pct = round((sec_vol / max_vol * 100), 2) if max_vol > 0 else 0
         
-    # 1. INITIALIZATION (First run of the day)
+    # 1. INITIALIZATION
     if mem_side["base"] == 0:
         mem_side["base"] = max_strike
         return {"strike": max_strike, "state": "Strong", "target_strike": 0, "pct": pct, "val": max_vol, "msg": f"{side_name} established at {max_strike}."}
@@ -312,7 +273,7 @@ def evaluate_side(vols_dict, mem_side, side_name):
     current_state = "Strong"
     target = 0
 
-    # 2. BASE CROSSOVER CHECK (A new strike hit 100%)
+    # 2. BASE CROSSOVER CHECK
     if max_strike != mem_side["base"]:
         mem_side["old_base"] = mem_side["base"]
         mem_side["base"] = max_strike
@@ -322,28 +283,23 @@ def evaluate_side(vols_dict, mem_side, side_name):
         
     # 3. INTELLIGENT STATE EVALUATION
     if mem_side["is_shifting"]:
-        # Scenario A: We are looking at the old decaying base
         if sec_strike == mem_side["old_base"]:
             mem_side["lowest_pct"] = min(mem_side["lowest_pct"], pct)
             
             if pct < 75.0:
-                # The umbilical cord is cut. Shift is fully complete.
                 mem_side["is_shifting"] = False
                 mem_side["old_base"] = 0
                 msg = f"Shift Complete: {side_name} has successfully consolidated at {max_strike}."
                 current_state = "Strong"
             else:
                 if mem_side["lowest_pct"] < 75.0:
-                    # The Threat Returns! (True STB/STT)
                     current_state = "STT" if sec_strike > max_strike else "STB"
                     target = sec_strike
                     direction = "bullish" if current_state == "STT" else "bearish"
                     msg = f"Renewed Pressure: Old {side_name} at {sec_strike} is fighting back, creating {direction} pressure."
                 else:
-                    # Shift is just incomplete. Residual noise is ignored.
                     current_state = "Strong"
                     
-        # Scenario B: THE ACTIVE CHALLENGER OVERRIDE
         else:
             if pct >= 75.0:
                 current_state = "STT" if sec_strike > max_strike else "STB"
@@ -353,26 +309,22 @@ def evaluate_side(vols_dict, mem_side, side_name):
             else:
                 current_state = "Strong"
                 
-    # 4. NORMAL STABLE EVALUATION (No shift in progress)
     else:
         if pct >= 75.0:
             current_state = "STT" if sec_strike > max_strike else "STB"
             target = sec_strike
             
-    # Generate simple pressure messages if state changed normally without a specific override message
     if msg == "" and current_state != mem_side["state"]:
         if current_state == "STT": msg = f"Bullish Pressure: {side_name} is Sliding Towards Top ({target})."
         elif current_state == "STB": msg = f"Bearish Pressure: {side_name} is Sliding Towards Bottom ({target})."
         elif current_state == "Strong": msg = f"{side_name} has become Strong at {max_strike}."
         
-    # Save the current state to memory for the next minute
     mem_side["state"] = current_state
     mem_side["target"] = target
     
     return {"strike": max_strike, "state": current_state, "target_strike": target, "pct": pct, "val": max_vol, "msg": msg}
 
 def generate_plain_english_status(res_state, sup_state):
-    """Creates the beautiful plain-text readout for the UI Header"""
     res_desc = "in a Strong position"
     if res_state == "STT": res_desc = "experiencing bullish pressure (Sliding Towards Top)"
     elif res_state == "STB": res_desc = "experiencing bearish pressure (Sliding Towards Bottom)"
@@ -387,7 +339,6 @@ def calculate_coa(chain_rows, symbol, expiry):
     global COA_MEMORY
     mem_key = f"{symbol}_{expiry}"
     
-    # Initialize the complex memory block for this specific expiry
     if mem_key not in COA_MEMORY: 
         COA_MEMORY[mem_key] = {
             "sup_mem": {"base": 0, "old_base": 0, "is_shifting": False, "lowest_pct": 100.0, "state": "Strong", "target": 0},
@@ -399,22 +350,19 @@ def calculate_coa(chain_rows, symbol, expiry):
     ce_vols = {r['strike']: r['ce'].get('volume', 0) for r in chain_rows if r['ce'].get('volume')}
     pe_vols = {r['strike']: r['pe'].get('volume', 0) for r in chain_rows if r['pe'].get('volume')}
     
-    # Evaluate both sides using our new State Machine
     res = evaluate_side(ce_vols, mem['res_mem'], "Resistance")
     sup = evaluate_side(pe_vols, mem['sup_mem'], "Support")
     
-    # Add new timeline events to the historical log array
     current_time = datetime.now().strftime("%I:%M %p")
     new_logs = []
     if res['msg']: new_logs.append(f"{current_time} - {res['msg']}")
     if sup['msg']: new_logs.append(f"{current_time} - {sup['msg']}")
     
     if new_logs:
-        mem['logs'] = (new_logs + mem['logs'])[:100] # Keeps the last 100 events
+        mem['logs'] = (new_logs + mem['logs'])[:100]
 
     plain_english_status = generate_plain_english_status(res['state'], sup['state'])
     
-    # 🟢 R1/S1 & R2/S2 CALCULATIONS
     step = SYMBOL_MAP.get(symbol, {}).get("step", 50)
     
     res_row = next((r for r in chain_rows if r['strike'] == res['strike']), None)
@@ -423,7 +371,6 @@ def calculate_coa(chain_rows, symbol, expiry):
     r1_val = res_row['ce_prz'] if res_row else res['strike']
     s1_val = sup_row['pe_prz'] if sup_row else sup['strike']
     
-    # Calculate strikes for R2 (Up) and S2 (Down)
     r2_strike = res['strike'] + step if res['strike'] > 0 else 0
     s2_strike = sup['strike'] - step if sup['strike'] > 0 else 0
     
@@ -437,94 +384,16 @@ def calculate_coa(chain_rows, symbol, expiry):
         "scenario_desc": plain_english_status, 
         "support": sup, 
         "resistance": res, 
-        "s1": s1_val,  # Old EOS
-        "r1": r1_val,  # Old EOR
-        "s2": s2_val,  # New S-2 Boundary
-        "r2": r2_val,  # New R-2 Boundary
+        "s1": s1_val,  
+        "r1": r1_val,  
+        "s2": s2_val,  
+        "r2": r2_val,  
         "logs": mem['logs']
     }
-# ══════════════════════════════════════════════════════════
-#  🟢 AUTOMATED 9:15 to 3:30 RECORDER (MONGODB UPDATE)
-# ══════════════════════════════════════════════════════════def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
-    if not chain_rows or not spot: return
-    
-    ts = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    time_key = ts.strftime("%I:%M %p")
-    date_str = ts.strftime("%Y-%m-%d")
-
-    step = SYMBOL_MAP[symbol]["step"]
-    atm = round(spot / step) * step
-    
-    compressed_chain = []
-    for r in chain_rows:
-        if abs(r['strike'] - atm) <= (20 * step): 
-            compressed_chain.append([
-                r['strike'],
-                r['ce'].get('oi', 0),
-                r['ce'].get('volume', 0),
-                float(r['ce'].get('ltp', 0)),
-                r['pe'].get('oi', 0),
-                r['pe'].get('volume', 0),
-                float(r['pe'].get('ltp', 0))
-            ])
-
-    snapshot = {
-        "sym": symbol,
-        "exp": expiry,
-        "date": date_str,
-        "time_key": time_key,
-        "createdAt": datetime.utcnow(), 
-        "spot": spot,
-        "pcr": pcr,
-        "chain": compressed_chain
-    }
-
-    try:
-        history_col.update_one(
-            {"sym": symbol, "exp": expiry, "date": date_str, "time_key": time_key},
-            {"$set": snapshot},
-            upsert=True
-        )
-        print(f"💾 SAVED TO MONGO: {symbol} at {time_key}") # 🟢 NEW: Confirms actual DB save
-    except Exception as e:
-        print(f"❌ MongoDB Record Error: {e}")
-
-def record_market_snapshot():
-    ist = pytz.timezone('Asia/Kolkata')
-    now = datetime.now(ist)
-    
-    is_weekday = now.weekday() < 5
-    is_market_open = (
-        (now.hour == 9 and now.minute >= 15) or 
-        (now.hour > 9 and now.hour < 15) or 
-        (now.hour == 15 and now.minute <= 30)
-    )
-    
-    global _access_token
-    
-    # 🟢 NEW: LOUD DIAGNOSTICS
-    print(f"⚙️ Engine Check [{now.strftime('%H:%M:%S')}]: Weekday={is_weekday}, Open={is_market_open}, Token={'YES' if _access_token else 'NO'}")
-
-    if not _access_token:
-        print("🛑 RECORDER BLOCKED: No Upstox token found! Please visit /login to authenticate.")
-        return
-
-    if is_weekday and is_market_open:
-        try:
-            for sym in SYMBOL_MAP.keys():
-                fetch_and_record(sym)
-            print(f"📸 Snapshots batch complete for {now.strftime('%H:%M:%S')} IST")
-        except Exception as e:
-            print(f"❌ Failed to record market snapshot: {str(e)}")
-    elif not is_market_open:
-        print("💤 Market is closed. Engine sleeping.")
-
 
 # ══════════════════════════════════════════════════════════
 #  🟢 TERMINAL DATA ROUTES
 # ══════════════════════════════════════════════════════════
-def auth_headers(): return {"Authorization": f"Bearer {_access_token}", "Accept": "application/json"}
-
 @app.route("/debug-keys")
 def debug_keys():
     import gzip, csv, io, requests
@@ -536,27 +405,20 @@ def debug_keys():
         csv_reader = csv.reader(io.TextIOWrapper(decompressed_file, 'utf-8'))
         
         headers = next(csv_reader)
-        
         midcap_matches = []
         crude_matches = []
         
         for row in csv_reader:
             if len(row) < 10: continue
-            
-            # Look for Midcap index
             if row[9] == 'INDEX' and 'MID' in row[3].upper():
                 midcap_matches.append({"key": row[0], "name": row[3], "symbol": row[2]})
-            
-            # Look for Crude Oil futures
             if 'FUT' in row[9].upper() and 'CRUDEOIL' in row[3].upper():
                 crude_matches.append({"key": row[0], "name": row[3], "type": row[9], "expiry": row[5]})
         
-        # Sort crude by closest expiry
         crude_matches.sort(key=lambda x: x["expiry"])
-        
         return jsonify({
-            "1_MIDCAP_INDEX_FOUND": midcap_matches[:5], # Show top 5 matches
-            "2_CRUDE_FUTURES_FOUND": crude_matches[:5]  # Show top 5 matches
+            "1_MIDCAP_INDEX_FOUND": midcap_matches[:5],
+            "2_CRUDE_FUTURES_FOUND": crude_matches[:5] 
         })
     except Exception as e:
         return jsonify({"error": str(e)})
@@ -579,7 +441,7 @@ def expiry_dates():
             return jsonify({"symbol": symbol, "expiries": expiries})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
-else:
+    else: # 🟢 Indentation perfectly fixed here!
         cfg = SYMBOL_MAP.get(symbol)
         resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
         data = resp.json().get("data") or []
@@ -591,7 +453,6 @@ else:
 def available_dates():
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
     expiry = request.args.get("expiry", "").strip()
-    
     if not symbol or not expiry: 
         return jsonify({"error": "Missing parameters"}), 400
         
@@ -725,8 +586,6 @@ def load_saved_token():
         
         token = token_doc.get("access_token", "")
         
-        # 🟢 FIX: Just check if token exists. Removed the strict date check
-        # that was killing valid tokens at midnight.
         if token:
             _access_token = token
             print(f"✅ Token loaded into RAM from MongoDB.")
@@ -740,7 +599,6 @@ def load_saved_token():
 def save_token(token):
     global _access_token
     
-    # 🟢 CRITICAL GUARDRAIL: Prevent overwriting the DB with an empty token
     if not token or token == "None":
         print("⚠️ save_token aborted: Attempted to save an empty or invalid token.")
         return False
@@ -761,6 +619,7 @@ def save_token(token):
     except Exception as e:
         print(f"❌ Failed to save token to MongoDB: {e}")
         return False
+
 @app.route("/login")
 def login_route():
     params = {"response_type": "code", "client_id": API_KEY, "redirect_uri": REDIRECT_URI}
@@ -824,7 +683,6 @@ def user_profile():
         if updates:
             users_col.update_one({"_id": uid}, {"$set": updates})
 
-    # 🟢 BULLETPROOF EXPIRY CHECK 
     formatted_expiry = None
     if user_doc.get("tier") == "pro":
         raw_expiry = user_doc.get("expiry")
@@ -1105,6 +963,8 @@ def fetch_and_record(symbol):
         
     except Exception as e: 
         print(f"Record Error {symbol}: {e}")
+
+# (Blank line correctly placed before the route decorator)
 @app.route("/cron/record", methods=['GET'])
 def trigger_record():
     """This route is pinged every 60s by an external cron service"""
