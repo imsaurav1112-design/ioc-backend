@@ -41,17 +41,23 @@ REDIRECT_URI = "https://ioc-backend-kq9x.onrender.com/callback"
 BASE_URL   = "https://api.upstox.com/v2"
 _access_token = None
 
+# 🟢 THE BULLETPROOF SYMBOL MAP
 SYMBOL_MAP = {
+    # NSE INDICES
     "NIFTY":      {"instrument_key": "NSE_INDEX|Nifty 50",            "lot": 75,  "step": 50},
-    "BANKNIFTY":  {"instrument_key": "NSE_INDEX|Nifty Bank",          "lot": 30,  "step": 100},
+    "BANKNIFTY":  {"instrument_key": "NSE_INDEX|Nifty Bank",          "lot": 30,  "step": 100}, # Update to 15 if your broker switched
     "FINNIFTY":   {"instrument_key": "NSE_INDEX|Nifty Fin Service",   "lot": 40,  "step": 50},
+    
+    # 🟢 The exact string Upstox requires for Midcap Select
     "MIDCPNIFTY": {"instrument_key": "NSE_INDEX|Nifty Mid Select",    "lot": 50,  "step": 25}, 
+    
+    # BSE INDICES
     "SENSEX":     {"instrument_key": "BSE_INDEX|SENSEX",              "lot": 20,  "step": 100}, 
     "BANKEX":     {"instrument_key": "BSE_INDEX|BANKEX",              "lot": 15,  "step": 100},
     
-    # 🟢 COMMODITIES: Flagged for Dynamic Lookup
-    "CRUDEOIL":   {"instrument_key": "MCX_FO|CRUDEOIL",   "is_mcx": True, "lot": 100, "step": 10},
-    "NATURALGAS": {"instrument_key": "MCX_FO|NATURALGAS", "is_mcx": True, "lot": 1250,"step": 5}
+    # 🟢 COMMODITIES: Moved from MCX_FO to NSE_COM based on deep scan
+    "CRUDEOIL":   {"instrument_key": "NSE_COM|CRUDEOIL",              "lot": 100, "step": 10},
+    "NATURALGAS": {"instrument_key": "NSE_COM|NATURALGAS",            "lot": 1250,"step": 5}
 }
 
 import gzip, csv, io
@@ -573,12 +579,9 @@ def expiry_dates():
             return jsonify({"symbol": symbol, "expiries": expiries})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
-    else:
+else:
         cfg = SYMBOL_MAP.get(symbol)
-        # 🟢 THE FIX: Ask the Hunter for the key if it's a commodity
-        inst_key = get_dynamic_mcx_key(symbol) if cfg.get("is_mcx") else cfg["instrument_key"]
-        
-        resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": inst_key}, headers=auth_headers())
+        resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
         data = resp.json().get("data") or []
         expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
         return jsonify({"symbol": symbol, "expiries": expiries})
@@ -660,14 +663,11 @@ def options_chain():
     expiry = request.args.get("expiry", "").strip()
     cfg = SYMBOL_MAP.get(symbol)
 
-    # 🟢 THE FIX
-    inst_key = get_dynamic_mcx_key(symbol) if cfg.get("is_mcx") else cfg["instrument_key"]
-
-    resp = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": inst_key, "expiry_date": expiry}, headers=auth_headers())
+    resp = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": cfg["instrument_key"], "expiry_date": expiry}, headers=auth_headers())
     raw_list = resp.json().get("data") or []
     if not raw_list: return jsonify({"error": "No data from Upstox"}), 502
 
-    spot_resp = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": inst_key}, headers=auth_headers())
+    spot_resp = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
 
     spot = None
     if spot_resp.status_code == 200:
@@ -1065,20 +1065,17 @@ def fetch_and_record(symbol):
     cfg = SYMBOL_MAP.get(symbol)
     if not cfg: return
     
-    # 🟢 THE FIX: Use the dynamic hunter for Commodities, static key for Indices
-    inst_key = get_dynamic_mcx_key(symbol) if cfg.get("is_mcx") else cfg["instrument_key"]
-    
     try:
         # Get expiry
-        r = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": inst_key}, headers=auth_headers())
+        r = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
         exp = r.json()["data"][0]["expiry"]
         
         # Get spot
-        r = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": inst_key}, headers=auth_headers())
+        r = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
         spot = list(r.json()["data"].values())[0]["last_price"]
         
         # Get Chain
-        r = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": inst_key, "expiry_date": exp}, headers=auth_headers())
+        r = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": cfg["instrument_key"], "expiry_date": exp}, headers=auth_headers())
         raw = r.json()["data"]
         
         rows, tce, tpe = [], 0, 0
