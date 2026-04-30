@@ -1,8 +1,8 @@
 """
 InsiderOwl — Upstox Live Market Backend (Cloud Edition)
 ====================================================================
-Includes 9:15-3:30 Automated Background Recorder (MongoDB Atlas).
 Includes Split-Brain Routing to bypass Upstox MCX Option Chain limits.
+Properly handles Commodity Option vs Future Expiry Date offsets.
 Provides raw instrument_keys to the frontend for WebSocket live feed.
 """
 
@@ -25,7 +25,6 @@ from firebase_admin import credentials, auth
 import razorpay
 
 app = Flask(__name__)
-# Allow cross-origin requests
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 # ══════════════════════════════════════════════════════════
@@ -34,8 +33,7 @@ CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 API_KEY      = "3e51765a-3794-41ab-b3c9-4a88e0d55e30"
 API_SECRET   = "1ky9l299rf"
 REDIRECT_URI = "https://ioc-backend-kq9x.onrender.com/callback"
-
-BASE_URL   = "https://api.upstox.com/v2"
+BASE_URL     = "https://api.upstox.com/v2"
 _access_token = None
 
 # 🟢 SYMBOL MAP
@@ -43,12 +41,9 @@ SYMBOL_MAP = {
     "NIFTY":      {"instrument_key": "NSE_INDEX|Nifty 50",            "lot": 75,  "step": 50},
     "BANKNIFTY":  {"instrument_key": "NSE_INDEX|Nifty Bank",          "lot": 15,  "step": 100}, 
     "FINNIFTY":   {"instrument_key": "NSE_INDEX|Nifty Fin Service",   "lot": 40,  "step": 50},
-    # 🟢 FIXED: Permanent Numeric Token for Midcap
     "MIDCPNIFTY": {"instrument_key": "NSE_INDEX|288009",              "lot": 50,  "step": 25}, 
     "SENSEX":     {"instrument_key": "BSE_INDEX|SENSEX",              "lot": 20,  "step": 100}, 
     "BANKEX":     {"instrument_key": "BSE_INDEX|BANKEX",              "lot": 15,  "step": 100},
-    
-    # 🟢 COMMODITIES: Flagged to trigger Custom Chain Builder
     "CRUDEOIL":   {"is_mcx": True, "base_name": "CRUDEOIL",   "lot": 100, "step": 10},
     "NATURALGAS": {"is_mcx": True, "base_name": "NATURALGAS", "lot": 1250,"step": 5}
 }
@@ -59,8 +54,14 @@ SYMBOL_MAP = {
 MCX_MASTER_DICT = {}
 LAST_MCX_FETCH_DATE = None
 
+def parse_upstox_date(d_str):
+    for fmt in ('%d-%b-%Y', '%Y-%m-%d', '%d-%m-%Y'):
+        try: return datetime.strptime(d_str, fmt).date()
+        except ValueError: pass
+    return datetime.max.date()
+
 def ensure_mcx_master():
-    """Downloads MCX.csv.gz and maps every Strike to its specific Call/Put Upstox Key"""
+    """Builds a database pairing Option Expiries with the nearest Future Expiry"""
     global MCX_MASTER_DICT, LAST_MCX_FETCH_DATE
     today = datetime.now().strftime("%Y-%m-%d")
     if LAST_MCX_FETCH_DATE == today and MCX_MASTER_DICT: return
@@ -71,49 +72,62 @@ def ensure_mcx_master():
         
         with gzip.open(io.BytesIO(response.content), 'rt') as f:
             reader = csv.DictReader(f)
-            new_dict = {}
+            futs = []
+            opts = {}
             
             for row in reader:
                 name = row.get('name', '').upper()
+                tsym = row.get('tradingsymbol', '').upper()
+                
+                # 🟢 FIX 1: Safely catch CRUDE OIL (with space) and NATURALGAS
                 base = None
-                if 'CRUDEOIL' in name: base = 'CRUDEOIL'
-                elif 'NATURALGAS' in name or 'NATGAS' in name: base = 'NATURALGAS'
+                if 'CRUDE' in name or 'CRUDE' in tsym: base = 'CRUDEOIL'
+                elif 'NATGAS' in name or 'NATURALGAS' in name or 'NATGAS' in tsym: base = 'NATURALGAS'
                 else: continue
                 
+                # 🟢 FIX 2: Explicitly block MINI contracts to avoid key corruption
+                if 'MINI' in name or 'MINI' in tsym or tsym.startswith('CRUDEOILM') or tsym.startswith('NATGASM'):
+                    continue
+                    
                 exp = row.get('expiry')
                 if not exp: continue
                 
                 itype = row.get('instrument_type', '').upper()
                 key = row.get('instrument_key')
                 
-                if base not in new_dict: new_dict[base] = {}
-                if exp not in new_dict[base]: new_dict[base][exp] = {"FUT": None, "OPT": {}}
-                
-                # Check for Futures or Options
                 if itype in ['FUTCOM', 'FUTENR', 'FUT']:
-                    if 'MINI' not in name: new_dict[base][exp]["FUT"] = key
+                    futs.append({'base': base, 'key': key, 'date': parse_upstox_date(exp)})
                 elif itype == 'OPTFUT':
+                    if base not in opts: opts[base] = {}
+                    if exp not in opts[base]: opts[base][exp] = {'strikes': {}, 'date': parse_upstox_date(exp)}
                     try:
                         strike = float(row.get('strike'))
-                        opt_type = row.get('option_type')
-                        if strike not in new_dict[base][exp]["OPT"]:
-                            new_dict[base][exp]["OPT"][strike] = {}
-                        new_dict[base][exp]["OPT"][strike][opt_type] = key
-                    except: pass            
-        MCX_MASTER_DICT = new_dict
+                        opt_type = row.get('option_type').upper() # CE or PE
+                        if strike not in opts[base][exp]['strikes']: opts[base][exp]['strikes'][strike] = {}
+                        opts[base][exp]['strikes'][strike][opt_type] = key
+                    except: pass
+                    
+        # 🟢 FIX 3: Link every Option Expiry to the nearest Future Expiry for the Spot Price
+        for base, exps in opts.items():
+            base_futs = sorted([f for f in futs if f['base'] == base], key=lambda x: x['date'])
+            for exp_str, data in exps.items():
+                valid_futs = [f for f in base_futs if f['date'] >= data['date']]
+                data['fut_key'] = valid_futs[0]['key'] if valid_futs else None
+                
+        MCX_MASTER_DICT = opts
         LAST_MCX_FETCH_DATE = today
+        print("✅ MCX Master Dictionary Cached Successfully.")
     except Exception as e:
         print(f"❌ Failed to build MCX Dictionary: {e}")
 
 def fetch_custom_mcx_chain(base_name, expiry_str, headers):
-    """Bypasses native API: Uses Quotes API to manually construct an MCX option chain"""
     ensure_mcx_master()
     if base_name not in MCX_MASTER_DICT or expiry_str not in MCX_MASTER_DICT[base_name]:
         return [], None
         
     data = MCX_MASTER_DICT[base_name][expiry_str]
-    fut_key = data.get("FUT")
-    opt_map = data.get("OPT", {})
+    fut_key = data.get("fut_key")
+    opt_map = data.get("strikes", {})
     
     spot = None
     if fut_key:
@@ -130,39 +144,36 @@ def fetch_custom_mcx_chain(base_name, expiry_str, headers):
         
     if not keys_to_fetch: return [], spot
     
-    raw_list = []
+    # 🟢 FIX 4: Safe Batch Fetching
+    all_quotes = {}
     try:
-        # Split into batches of 50 to avoid Upstox URL length limits
         for i in range(0, len(keys_to_fetch), 50):
             batch = keys_to_fetch[i:i+50]
             r = requests.get(f"{BASE_URL}/market-quote/quotes", params={"instrument_key": ",".join(batch)}, headers=headers)
-            quotes = r.json().get("data", {})
-            
-            for strike, types in opt_map.items():
-                ce_key, pe_key = types.get("CE"), types.get("PE")
-                cq, pq = quotes.get(ce_key, {}), quotes.get(pe_key, {})
-                if not cq and not pq: continue
-                
-                raw_list.append({
-                    "strike_price": float(strike),
-                    "underlying_spot_price": spot or 0,
-                    "call_options": {
-                        "instrument_key": ce_key, # 🟢 RAW KEY FOR WEBSOCKET
-                        "market_data": {
-                            "ltp": cq.get("last_price", 0), "oi": cq.get("open_interest", 0), 
-                            "volume": cq.get("volume", 0), "prev_oi": 0
-                        }
-                    },
-                    "put_options": {
-                        "instrument_key": pe_key, # 🟢 RAW KEY FOR WEBSOCKET
-                        "market_data": {
-                            "ltp": pq.get("last_price", 0), "oi": pq.get("open_interest", 0), 
-                            "volume": pq.get("volume", 0), "prev_oi": 0
-                        }
-                    }
-                })
+            if r.status_code == 200:
+                all_quotes.update(r.json().get("data", {}))
     except Exception as e:
-        print(f"MCX custom fetch error: {e}")
+        print(f"MCX batch fetch error: {e}")
+        
+    raw_list = []
+    for strike, types in opt_map.items():
+        ce_key, pe_key = types.get("CE"), types.get("PE")
+        cq, pq = all_quotes.get(ce_key, {}), all_quotes.get(pe_key, {})
+        
+        if not cq and not pq: continue
+        
+        raw_list.append({
+            "strike_price": float(strike),
+            "underlying_spot_price": spot or 0,
+            "call_options": {
+                "instrument_key": ce_key or "",
+                "market_data": {"ltp": cq.get("last_price", 0), "oi": cq.get("open_interest", 0), "volume": cq.get("volume", 0), "prev_oi": 0}
+            } if cq else None,
+            "put_options": {
+                "instrument_key": pe_key or "",
+                "market_data": {"ltp": pq.get("last_price", 0), "oi": pq.get("open_interest", 0), "volume": pq.get("volume", 0), "prev_oi": 0}
+            } if pq else None
+        })
         
     return raw_list, spot
 
@@ -172,8 +183,7 @@ def fetch_custom_mcx_chain(base_name, expiry_str, headers):
 try:
     cred = credentials.Certificate(os.path.join(os.getcwd(), 'firebase-admin.json'))
     firebase_admin.initialize_app(cred)
-except Exception as e:
-    print(f"⚠️ Firebase Admin Init Error (Auth will fail): {e}")
+except Exception as e: pass
 
 from urllib.parse import quote_plus
 DB_USERNAME = quote_plus("insideowl")
@@ -185,8 +195,7 @@ try:
     db = mongo_client["ioc_terminal"]
     sys_col, users_col, history_col = db["system_config"], db["users"], db["history"]
     history_col.create_index("createdAt", expireAfterSeconds=3456000)
-except Exception as e:
-    print(f"❌ MongoDB Connection Error: {e}")
+except Exception as e: pass
 
 RZP_KEY_ID = "rzp_test_ShbvbudW5LV1v3"
 RZP_KEY_SECRET = "Yz6P5jckKk6OyfuqvZ21YCXG"
@@ -393,7 +402,10 @@ def calculate_coa(chain_rows, symbol, expiry):
 #  🟢 TERMINAL DATA ROUTES (SPLIT-BRAIN)
 # ══════════════════════════════════════════════════════════
 @app.route("/health")
-def health(): return jsonify({"status": "ok", "authenticated": _access_token is not None})
+def health(): 
+    is_auth = _access_token is not None
+    if not is_auth: is_auth = load_saved_token()
+    return jsonify({"status": "ok", "authenticated": is_auth})
 
 @app.route("/expiry-dates", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
@@ -414,12 +426,11 @@ def expiry_dates():
         ensure_mcx_master()
         base = cfg["base_name"]
         valid_exps = []
-        for e in MCX_MASTER_DICT.get(base, {}).keys():
-            try:
-                d = datetime.strptime(e, "%Y-%m-%d").date()
-                if d >= datetime.now().date(): valid_exps.append(e)
-            except: valid_exps.append(e)
-        return jsonify({"symbol": symbol, "expiries": sorted(valid_exps)})
+        for e, data in MCX_MASTER_DICT.get(base, {}).items():
+            if data['date'] >= datetime.now().date():
+                valid_exps.append(e)
+        valid_exps.sort(key=lambda x: MCX_MASTER_DICT[base][x]['date'])
+        return jsonify({"symbol": symbol, "expiries": valid_exps})
     else:
         resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
         data = resp.json().get("data") or []
@@ -551,14 +562,12 @@ def fetch_and_record(symbol):
             ensure_mcx_master()
             base = cfg["base_name"]
             valid_exps = []
-            for e in MCX_MASTER_DICT.get(base, {}).keys():
-                try:
-                    d = datetime.strptime(e, "%Y-%m-%d").date()
-                    if d >= datetime.now().date(): valid_exps.append((e, d))
-                except: pass
+            for e, data in MCX_MASTER_DICT.get(base, {}).items():
+                if data['date'] >= datetime.now().date():
+                    valid_exps.append(e)
             if not valid_exps: return
-            valid_exps.sort(key=lambda x: x[1])
-            exp = valid_exps[0][0]
+            valid_exps.sort(key=lambda x: MCX_MASTER_DICT[base][x]['date'])
+            exp = valid_exps[0]
             raw, spot = fetch_custom_mcx_chain(base, exp, auth_headers())
         else:
             r = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
@@ -654,11 +663,8 @@ def callback_route():
 @app.route("/user-profile", methods=['GET', 'OPTIONS'])
 @require_firebase_auth
 def user_profile():
-    return jsonify({
-        "tier": "pro", 
-        "email": request.user.get('email', ''),
-        "wallet_balance": 0.00  # Add this line
-    })
+    # 🟢 FIXED: Ensures wallet_balance is always returned to prevent .toFixed() frontend crash
+    return jsonify({"tier": "pro", "email": request.user.get('email', ''), "wallet_balance": 0.00})
 
 if __name__ == "__main__":
     load_saved_token()
