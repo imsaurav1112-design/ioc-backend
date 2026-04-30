@@ -654,7 +654,11 @@ def callback_route():
 @app.route("/user-profile", methods=['GET', 'OPTIONS'])
 @require_firebase_auth
 def user_profile():
-    return jsonify({"tier": "pro", "email": request.user.get('email', '')})
+    return jsonify({
+        "tier": "pro", 
+        "email": request.user.get('email', ''),
+        "wallet_balance": 0.00  # Add this line
+    })
 
 if __name__ == "__main__":
     load_saved_token()
