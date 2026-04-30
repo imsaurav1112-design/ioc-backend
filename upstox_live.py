@@ -2,7 +2,8 @@
 InsiderOwl — Upstox Live Market Backend (Cloud Edition)
 ====================================================================
 Streamlined Core Indices Version.
-IST Timezone completely enforced across all routes.
+IST Timezone enforced.
+Includes Paper Trading Database & 3:30 PM Auto-Emailer.
 """
 
 import os, sys, time, json, requests
@@ -16,6 +17,11 @@ from scipy.optimize import brentq, fsolve
 from functools import wraps
 import pytz
 import gzip, csv, io
+
+# 🟢 NEW: Email Imports for the 3:30 PM Trade Report
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 # 🟢 CLOUD IMPORTS
 from pymongo import MongoClient
@@ -35,11 +41,9 @@ REDIRECT_URI = "https://ioc-backend-kq9x.onrender.com/callback"
 BASE_URL     = "https://api.upstox.com/v2"
 _access_token = None
 
-# 🟢 HELPER: Force IST Time Everywhere
 def get_ist_now():
     return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
-# 🟢 SYMBOL MAP (Streamlined to Core 5 Indices)
 SYMBOL_MAP = {
     "NIFTY":      {"instrument_key": "NSE_INDEX|Nifty 50",            "lot": 75,  "step": 50},
     "BANKNIFTY":  {"instrument_key": "NSE_INDEX|Nifty Bank",          "lot": 15,  "step": 100}, 
@@ -49,7 +53,7 @@ SYMBOL_MAP = {
 }
 
 # ══════════════════════════════════════════════════════════
-#  🟢 DYNAMIC MCX CUSTOM CHAIN BUILDER (Dormant for now)
+#  🟢 DYNAMIC MCX CUSTOM CHAIN BUILDER (Dormant)
 # ══════════════════════════════════════════════════════════
 MCX_MASTER_DICT = {}
 LAST_MCX_FETCH_DATE = None
@@ -157,7 +161,13 @@ MONGO_URI = f"mongodb+srv://{DB_USERNAME}:{DB_PASSWORD}@ioc.ecqcgvo.mongodb.net/
 try:
     mongo_client = MongoClient(MONGO_URI)
     db = mongo_client["ioc_terminal"]
-    sys_col, users_col, history_col = db["system_config"], db["users"], db["history"]
+    sys_col = db["system_config"]
+    users_col = db["users"]
+    history_col = db["history"]
+    
+    # 🟢 NEW: Added Collection for Paper Trades
+    paper_trades_col = db["paper_trades"]
+    
     history_col.create_index("createdAt", expireAfterSeconds=3456000)
 except Exception as e: pass
 
@@ -363,7 +373,7 @@ def calculate_coa(chain_rows, symbol, expiry):
     }
 
 # ══════════════════════════════════════════════════════════
-#  🟢 TERMINAL DATA ROUTES (SPLIT-BRAIN)
+#  🟢 TERMINAL DATA ROUTES
 # ══════════════════════════════════════════════════════════
 @app.route("/health")
 def health(): 
@@ -484,7 +494,69 @@ def intraday_history():
     except Exception as e: return jsonify({"error": str(e)}), 500
 
 # ══════════════════════════════════════════════════════════
-#  🟢 THE EXTERNAL CRON ENGINE
+#  🟢 NEW: PAPER TRADING ROUTES
+# ══════════════════════════════════════════════════════════
+@app.route("/api/paper-trade", methods=['POST', 'OPTIONS'])
+@require_firebase_auth
+def save_paper_trade():
+    if request.method == 'OPTIONS': return jsonify({"status": "ok"}), 200
+    try:
+        trade_data = request.json
+        trade_data["user_email"] = request.user.get('email', 'unknown_user')
+        trade_data["date"] = get_ist_now().strftime("%Y-%m-%d")
+        
+        paper_trades_col.insert_one(trade_data)
+        return jsonify({"status": "success"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/cron/email-trades", methods=['GET'])
+def email_daily_trades():
+    now = get_ist_now()
+    today_str = now.strftime("%Y-%m-%d")
+    
+    # ⚠️ EDIT THIS SECTION: Put your actual email and app password here ⚠️
+    SENDER_EMAIL = "your.email@gmail.com"
+    SENDER_APP_PASSWORD = "your_16_digit_app_password"
+    
+    try:
+        all_trades = list(paper_trades_col.find({"date": today_str}))
+        if not all_trades:
+            return jsonify({"status": "sleeping", "message": "No trades to email today."}), 200
+            
+        users = set(t.get("user_email") for t in all_trades if t.get("user_email"))
+        
+        for email in users:
+            user_trades = [t for t in all_trades if t.get("user_email") == email]
+            
+            html_table = f"<h2>Your Paper Trades for {today_str}</h2><table border='1' cellpadding='8' style='border-collapse: collapse;'>"
+            html_table += "<tr><th>Time</th><th>Symbol</th><th>Strike</th><th>Type</th><th>Entry</th><th>SL</th><th>Target</th></tr>"
+            
+            for t in user_trades:
+                html_table += f"<tr><td>{t.get('time','')}</td><td>{t.get('sym','')}</td><td>{t.get('strike','')}</td>"
+                html_table += f"<td>{t.get('type','')}</td><td>{t.get('entry','')}</td><td>{t.get('sl','')}</td><td>{t.get('target','')}</td></tr>"
+            html_table += "</table>"
+            
+            msg = MIMEMultipart()
+            msg['From'] = SENDER_EMAIL
+            msg['To'] = email
+            msg['Subject'] = f"GC Live: Daily Paper Trade Report ({today_str})"
+            msg.attach(MIMEText(html_table, 'html'))
+            
+            with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+                server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
+                server.send_message(msg)
+
+        # Wipe today's trades after emailing
+        paper_trades_col.delete_many({}) 
+        
+        return jsonify({"status": "success", "message": f"Emailed {len(users)} users and wiped today's trades."})
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ══════════════════════════════════════════════════════════
+#  🟢 THE EXTERNAL CRON ENGINE (HISTORY RECORDING)
 # ══════════════════════════════════════════════════════════
 def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
     if not chain_rows or not spot: return
