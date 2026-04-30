@@ -21,8 +21,12 @@ from firebase_admin import credentials, auth
 import razorpay
 
 app = Flask(__name__)
-CORS(app)
-
+# 🟢 UPDATED: Specifically allow all origins and headers for GitHub Pages compatibility
+CORS(app, resources={r"/*": {
+    "origins": "*",
+    "allow_headers": ["Authorization", "Content-Type"],
+    "methods": ["GET", "POST", "OPTIONS"]
+}}, supports_credentials=True)
 # ══════════════════════════════════════════════════════════
 #  🔑 CONFIGURATION & CLOUD SETUP
 # ══════════════════════════════════════════════════════════
@@ -83,17 +87,21 @@ rzp_client = razorpay.Client(auth=(RZP_KEY_ID, RZP_KEY_SECRET))
 def require_firebase_auth(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
+        # 🟢 THE FIX: Handle the browser's "Preflight" check
         if request.method == "OPTIONS":
             return jsonify({"status": "ok"}), 200
+            
         header = request.headers.get("Authorization")
         if not header or not header.startswith("Bearer "):
             return jsonify({"error": "Unauthorized Access"}), 401
+        
         token = header.split(" ")[1]
         try:
             decoded_token = auth.verify_id_token(token)
             request.user = decoded_token
         except Exception as e:
-            return jsonify({"error": "Invalid or Expired Token"}), 401
+            return jsonify({"error": "Invalid or Expired Token", "details": str(e)}), 401
+            
         return f(*args, **kwargs)
     return decorated_function
 
