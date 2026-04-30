@@ -42,11 +42,13 @@ BASE_URL   = "https://api.upstox.com/v2"
 _access_token = None
 
 SYMBOL_MAP = {
-    "NIFTY":      {"instrument_key": "NSE_INDEX|Nifty 50",            "lot": 75,  "step": 50},
+    "NIFTY":      {"instrument_key": "NSE_INDEX|Nifty 50",            "lot": 65,  "step": 50},
     "BANKNIFTY":  {"instrument_key": "NSE_INDEX|Nifty Bank",          "lot": 30,  "step": 100},
     "FINNIFTY":   {"instrument_key": "NSE_INDEX|Nifty Fin Service",   "lot": 40,  "step": 50},
     "MIDCPNIFTY": {"instrument_key": "NSE_INDEX|Nifty Midcap Select", "lot": 50,  "step": 25},
     "SENSEX":     {"instrument_key": "BSE_INDEX|SENSEX",              "lot": 20,  "step": 100}, 
+    "CRUDEOIL":   {"instrument_key": "MCX_FO|CRUDEOIL",               "lot": 100, "step": 10},
+    "NATURALGAS": {"instrument_key": "MCX_FO|NATURALGAS",             "lot": 1250,"step": 5}
 }
 
 # 🟢 FIREBASE ADMIN SETUP
