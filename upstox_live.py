@@ -521,28 +521,36 @@ def auth_headers(): return {"Authorization": f"Bearer {_access_token}", "Accept"
 
 @app.route("/debug-keys")
 def debug_keys():
+    import gzip, csv, io, requests
     try:
-        # Test Midcap
-        mid_key = SYMBOL_MAP["MIDCPNIFTY"]["instrument_key"]
-        r_mid = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": mid_key}, headers=auth_headers())
-        mid_status = r_mid.json()
-
-        # Test Crude
-        crude_key = get_dynamic_mcx_key("CRUDEOIL")
-        r_crude = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": crude_key}, headers=auth_headers())
-        crude_status = r_crude.json()
-
+        url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
+        response = requests.get(url, timeout=10)
+        compressed_file = io.BytesIO(response.content)
+        decompressed_file = gzip.GzipFile(fileobj=compressed_file)
+        csv_reader = csv.reader(io.TextIOWrapper(decompressed_file, 'utf-8'))
+        
+        headers = next(csv_reader)
+        
+        midcap_matches = []
+        crude_matches = []
+        
+        for row in csv_reader:
+            if len(row) < 10: continue
+            
+            # Look for Midcap index
+            if row[9] == 'INDEX' and 'MID' in row[3].upper():
+                midcap_matches.append({"key": row[0], "name": row[3], "symbol": row[2]})
+            
+            # Look for Crude Oil futures
+            if 'FUT' in row[9].upper() and 'CRUDEOIL' in row[3].upper():
+                crude_matches.append({"key": row[0], "name": row[3], "type": row[9], "expiry": row[5]})
+        
+        # Sort crude by closest expiry
+        crude_matches.sort(key=lambda x: x["expiry"])
+        
         return jsonify({
-            "1_MIDCAP_TEST": {
-                "key_used": mid_key,
-                "upstox_response_size": len(mid_status.get("data", [])),
-                "raw_response": mid_status.get("status")
-            },
-            "2_CRUDE_TEST": {
-                "key_generated_by_hunter": crude_key,
-                "upstox_response_size": len(crude_status.get("data", [])),
-                "raw_response": crude_status.get("status")
-            }
+            "1_MIDCAP_INDEX_FOUND": midcap_matches[:5], # Show top 5 matches
+            "2_CRUDE_FUTURES_FOUND": crude_matches[:5]  # Show top 5 matches
         })
     except Exception as e:
         return jsonify({"error": str(e)})
