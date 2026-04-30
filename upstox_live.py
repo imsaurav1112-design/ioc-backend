@@ -55,7 +55,8 @@ MCX_MASTER_DICT = {}
 LAST_MCX_FETCH_DATE = None
 
 def parse_upstox_date(d_str):
-    for fmt in ('%d-%b-%Y', '%Y-%m-%d', '%d-%m-%Y'):
+    # 🟢 FIX: Added 2-digit year format just in case Upstox changes it
+    for fmt in ('%d-%b-%Y', '%Y-%m-%d', '%d-%m-%Y', '%d-%b-%y'):
         try: return datetime.strptime(d_str, fmt).date()
         except ValueError: pass
     return datetime.max.date()
@@ -79,35 +80,38 @@ def ensure_mcx_master():
                 name = row.get('name', '').upper()
                 tsym = row.get('tradingsymbol', '').upper()
                 
-                # 🟢 FIX 1: Safely catch CRUDE OIL (with space) and NATURALGAS
                 base = None
                 if 'CRUDE' in name or 'CRUDE' in tsym: base = 'CRUDEOIL'
                 elif 'NATGAS' in name or 'NATURALGAS' in name or 'NATGAS' in tsym: base = 'NATURALGAS'
                 else: continue
                 
-                # 🟢 FIX 2: Explicitly block MINI contracts to avoid key corruption
                 if 'MINI' in name or 'MINI' in tsym or tsym.startswith('CRUDEOILM') or tsym.startswith('NATGASM'):
                     continue
                     
-                exp = row.get('expiry')
-                if not exp: continue
+                exp_raw = row.get('expiry')
+                if not exp_raw: continue
+                
+                # 🟢 FIX 1: Normalize ALL dates to YYYY-MM-DD immediately so it matches the frontend perfectly
+                parsed_date = parse_upstox_date(exp_raw)
+                exp_iso = parsed_date.strftime("%Y-%m-%d")
                 
                 itype = row.get('instrument_type', '').upper()
                 key = row.get('instrument_key')
                 
-                if itype in ['FUTCOM', 'FUTENR', 'FUT']:
-                    futs.append({'base': base, 'key': key, 'date': parse_upstox_date(exp)})
-                elif itype == 'OPTFUT':
+                if 'FUT' in itype and 'OPT' not in itype:
+                    futs.append({'base': base, 'key': key, 'date': parsed_date})
+                # 🟢 FIX 2: Safely catch 'OPTCOM', 'OPTFUT', 'OPTENR', etc. 
+                elif 'OPT' in itype:
                     if base not in opts: opts[base] = {}
-                    if exp not in opts[base]: opts[base][exp] = {'strikes': {}, 'date': parse_upstox_date(exp)}
+                    if exp_iso not in opts[base]: opts[base][exp_iso] = {'strikes': {}, 'date': parsed_date}
                     try:
                         strike = float(row.get('strike'))
                         opt_type = row.get('option_type').upper() # CE or PE
-                        if strike not in opts[base][exp]['strikes']: opts[base][exp]['strikes'][strike] = {}
-                        opts[base][exp]['strikes'][strike][opt_type] = key
+                        if strike not in opts[base][exp_iso]['strikes']: opts[base][exp_iso]['strikes'][strike] = {}
+                        opts[base][exp_iso]['strikes'][strike][opt_type] = key
                     except: pass
                     
-        # 🟢 FIX 3: Link every Option Expiry to the nearest Future Expiry for the Spot Price
+        # Link every Option Expiry to the nearest Future Expiry for the Spot Price
         for base, exps in opts.items():
             base_futs = sorted([f for f in futs if f['base'] == base], key=lambda x: x['date'])
             for exp_str, data in exps.items():
@@ -119,7 +123,6 @@ def ensure_mcx_master():
         print("✅ MCX Master Dictionary Cached Successfully.")
     except Exception as e:
         print(f"❌ Failed to build MCX Dictionary: {e}")
-
 def fetch_custom_mcx_chain(base_name, expiry_str, headers):
     ensure_mcx_master()
     if base_name not in MCX_MASTER_DICT or expiry_str not in MCX_MASTER_DICT[base_name]:
