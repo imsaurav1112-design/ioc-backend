@@ -519,6 +519,34 @@ def record_market_snapshot():
 # ══════════════════════════════════════════════════════════
 def auth_headers(): return {"Authorization": f"Bearer {_access_token}", "Accept": "application/json"}
 
+@app.route("/debug-keys")
+def debug_keys():
+    try:
+        # Test Midcap
+        mid_key = SYMBOL_MAP["MIDCPNIFTY"]["instrument_key"]
+        r_mid = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": mid_key}, headers=auth_headers())
+        mid_status = r_mid.json()
+
+        # Test Crude
+        crude_key = get_dynamic_mcx_key("CRUDEOIL")
+        r_crude = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": crude_key}, headers=auth_headers())
+        crude_status = r_crude.json()
+
+        return jsonify({
+            "1_MIDCAP_TEST": {
+                "key_used": mid_key,
+                "upstox_response_size": len(mid_status.get("data", [])),
+                "raw_response": mid_status.get("status")
+            },
+            "2_CRUDE_TEST": {
+                "key_generated_by_hunter": crude_key,
+                "upstox_response_size": len(crude_status.get("data", [])),
+                "raw_response": crude_status.get("status")
+            }
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
 @app.route("/health")
 def health(): return jsonify({"status": "ok", "authenticated": _access_token is not None})
 
