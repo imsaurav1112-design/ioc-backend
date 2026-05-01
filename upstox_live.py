@@ -709,6 +709,70 @@ def callback_route():
         return '✅ Login Successful!'
     return f'❌ Failed: {resp.text}'
 
+from datetime import timedelta
+
+@app.route("/pay-with-wallet", methods=['POST', 'OPTIONS'])
+@require_firebase_auth
+def pay_with_wallet():
+    if request.method == 'OPTIONS': 
+        return jsonify({"status": "ok"}), 200
+        
+    try:
+        uid = request.user.get('uid')
+        data = request.json
+        plan_id = data.get("plan")
+        cost = float(data.get("cost", 0))
+        
+        # 1. Validate the plan costs strictly on the backend so hackers can't send fake prices
+        plan_prices = {"1_month": 249, "3_months": 599, "6_months": 999}
+        plan_days = {"1_month": 30, "3_months": 90, "6_months": 180}
+        
+        if plan_id not in plan_prices or cost != plan_prices[plan_id]:
+            return jsonify({"error": "Invalid plan or price manipulation detected."}), 400
+            
+        user_doc = users_col.find_one({"_id": uid})
+        if not user_doc: 
+            return jsonify({"error": "User not found in database."}), 404
+        
+        current_balance = float(user_doc.get("wallet_balance", 0))
+        
+        # 2. Check if they actually have enough money
+        if current_balance < cost:
+            return jsonify({"error": "Insufficient wallet balance."}), 400
+            
+        # 3. Deduct the cost
+        new_balance = current_balance - cost
+        
+        # 4. Calculate the new Expiry Date safely
+        now = get_ist_now()
+        current_expiry = user_doc.get("expiry")
+        
+        # If they are already Pro, extend their current expiry date. Otherwise, start from today.
+        if user_doc.get("tier") == "pro" and current_expiry and current_expiry > now:
+            new_expiry = current_expiry + timedelta(days=plan_days[plan_id])
+        else:
+            new_expiry = now + timedelta(days=plan_days[plan_id])
+            
+        # 5. Save the updated Wallet Balance, Tier, and Expiry directly to MongoDB
+        users_col.update_one(
+            {"_id": uid},
+            {"$set": {
+                "wallet_balance": new_balance,
+                "tier": "pro",
+                "expiry": new_expiry
+            }}
+        )
+        
+        return jsonify({
+            "status": "success", 
+            "new_balance": new_balance, 
+            "new_expiry": new_expiry.strftime("%Y-%m-%d")
+        }), 200
+        
+    except Exception as e:
+        print("Wallet Payment Error:", e)
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/user-profile", methods=['GET', 'OPTIONS'])
 @require_firebase_auth
 def user_profile():
