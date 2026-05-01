@@ -712,8 +712,45 @@ def callback_route():
 @app.route("/user-profile", methods=['GET', 'OPTIONS'])
 @require_firebase_auth
 def user_profile():
-    return jsonify({"tier": "pro", "email": request.user.get('email', ''), "wallet_balance": 0.00})
+    if request.method == 'OPTIONS':
+        return jsonify({"status": "ok"}), 200
+        
+    try:
+        # 1. Get the Firebase User ID
+        uid = request.user.get('uid')
+        
+        # 2. Fetch the real profile from your MongoDB database
+        user_doc = users_col.find_one({"_id": uid})
+        
+        if user_doc:
+            # Format the expiry date safely if it exists
+            expiry_val = user_doc.get("expiry")
+            expiry_str = expiry_val.strftime("%Y-%m-%d") if hasattr(expiry_val, 'strftime') else str(expiry_val) if expiry_val else None
 
+            # 3. Return the real database values!
+            return jsonify({
+                "email": user_doc.get("email", request.user.get("email", "")),
+                "tier": user_doc.get("tier", "free"),
+                "name": user_doc.get("name", ""),
+                "referral_code": user_doc.get("referral_code", ""),
+                "wallet_balance": float(user_doc.get("wallet_balance", 0.00)),
+                "expiry_date": expiry_str
+            })
+        else:
+            # Fallback if a brand new user hasn't been added to the database yet
+            return jsonify({
+                "email": request.user.get("email", ""),
+                "tier": "free",
+                "name": "",
+                "referral_code": "",
+                "wallet_balance": 0.00
+            })
+            
+    except Exception as e:
+        print("Profile Fetch Error:", e)
+        return jsonify({"error": str(e)}), 500
+
+# KEEP THIS EXACTLY AS IT WAS:
 if __name__ == "__main__":
     load_saved_token()
     print("\n Server Running\n" + "-" * 45)
