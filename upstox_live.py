@@ -773,6 +773,110 @@ def pay_with_wallet():
         print("Wallet Payment Error:", e)
         return jsonify({"error": str(e)}), 500
 
+# ══════════════════════════════════════════════════════════
+#  🟢 RAZORPAY PAYMENT ROUTES
+# ══════════════════════════════════════════════════════════
+from datetime import timedelta
+
+@app.route("/create-order", methods=['POST', 'OPTIONS'])
+@require_firebase_auth
+def create_order():
+    if request.method == 'OPTIONS': 
+        return jsonify({"status": "ok"}), 200
+        
+    try:
+        data = request.json
+        plan_id = data.get("plan")
+        
+        # 1. Server-side price validation
+        plan_prices = {"1_month": 249, "3_months": 599, "6_months": 999}
+        if plan_id not in plan_prices:
+            return jsonify({"error": "Invalid Plan Selected"}), 400
+            
+        cost_inr = plan_prices[plan_id]
+        
+        # 2. Razorpay uses 'paise' (Multiply INR by 100)
+        amount_in_paise = int(cost_inr * 100)
+        
+        # 3. Create the order with Razorpay
+        order_data = {
+            "amount": amount_in_paise,
+            "currency": "INR",
+            "receipt": request.user.get('uid')[:15] # Short receipt ID
+        }
+        
+        order = rzp_client.order.create(data=order_data)
+        
+        return jsonify({
+            "order_id": order["id"],
+            "amount": order["amount"],
+            "key": RZP_KEY_ID
+        }), 200
+
+    except Exception as e:
+        print("Razorpay Order Creation Error:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/verify-payment", methods=['POST', 'OPTIONS'])
+@require_firebase_auth
+def verify_payment():
+    if request.method == 'OPTIONS': 
+        return jsonify({"status": "ok"}), 200
+        
+    try:
+        uid = request.user.get('uid')
+        data = request.json
+        
+        # 1. Extract Razorpay signature details
+        payment_id = data.get("razorpay_payment_id")
+        order_id = data.get("razorpay_order_id")
+        signature = data.get("razorpay_signature")
+        plan_id = data.get("plan")
+        
+        plan_days = {"1_month": 30, "3_months": 90, "6_months": 180}
+        if plan_id not in plan_days:
+            return jsonify({"error": "Invalid Plan"}), 400
+
+        # 2. Verify the mathematical signature so hackers can't fake a success
+        rzp_client.utility.verify_payment_signature({
+            'razorpay_order_id': order_id,
+            'razorpay_payment_id': payment_id,
+            'razorpay_signature': signature
+        })
+        
+        # 3. If signature is valid, fetch user
+        user_doc = users_col.find_one({"_id": uid})
+        if not user_doc: 
+            return jsonify({"error": "User not found"}), 404
+            
+        # 4. Calculate Expiry Date
+        now = get_ist_now()
+        current_expiry = user_doc.get("expiry")
+        
+        if user_doc.get("tier") == "pro" and current_expiry and current_expiry > now:
+            new_expiry = current_expiry + timedelta(days=plan_days[plan_id])
+        else:
+            new_expiry = now + timedelta(days=plan_days[plan_id])
+            
+        # 5. Upgrade the database
+        users_col.update_one(
+            {"_id": uid},
+            {"$set": {
+                "tier": "pro",
+                "expiry": new_expiry
+            }}
+        )
+        
+        return jsonify({"status": "success", "new_expiry": new_expiry.strftime("%Y-%m-%d")}), 200
+        
+    except razorpay.errors.SignatureVerificationError:
+        print("Fake Signature Detected from:", request.user.get('email'))
+        return jsonify({"error": "Payment signature validation failed."}), 400
+    except Exception as e:
+        print("Razorpay Verification Error:", e)
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/user-profile", methods=['GET', 'OPTIONS'])
 @require_firebase_auth
 def user_profile():
