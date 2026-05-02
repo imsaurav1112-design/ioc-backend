@@ -985,45 +985,45 @@ def get_footprint():
 # ══════════════════════════════════════════════════════════
 #  🟢 V-FOOTPRINT TEST CODE 
 # ══════════════════════════════════════════════════════════
-    import time
+import time
 import random
 
 def weekend_market_simulator():
-    """Generates fake Nifty trades when the real market is closed for UI testing."""
+    """Pumps fake volume into the dictionary when market is closed"""
     global footprint_candles
-    print("\n🟢 STARTING WEEKEND FOOTPRINT SIMULATOR...\n")
+    print("🟢 WEEKEND SIMULATOR BOOTING UP...")
     
-    current_price = 22500 # Starting base price for Nifty
+    current_price = 22500
     
     while True:
-        time.sleep(0.8) # Generate a fake trade every 0.8 seconds
+        time.sleep(1) # Generate 1 fake trade per second
         
-        # 1. Get the current candle time
         candle_key = get_current_candle_time()
+        
         if candle_key not in footprint_candles:
             footprint_candles[candle_key] = {}
+            print(f"🕯️ New 5-Min Candle Created: {candle_key}")
             
-        # 2. Simulate price movement (Up 1, Down 1, or stay flat)
+        # Simulate price movement
         current_price += random.choice([-1, 0, 1])
         strike = str(current_price)
         
         if strike not in footprint_candles[candle_key]:
             footprint_candles[candle_key][strike] = {"buy_vol": 0, "sell_vol": 0}
             
-        # 3. Simulate massive institutional volume spikes
+        # Simulate Institutional Volume
         vol = random.randint(10, 100)
-        
-        # Randomly create imbalances (300% differences) to test your neon UI colors
         if random.random() > 0.85: 
-            vol = random.randint(300, 800) 
+            vol = random.randint(300, 800) # Fake imbalance spike
             
         if random.random() > 0.5:
             footprint_candles[candle_key][strike]["buy_vol"] += vol
         else:
             footprint_candles[candle_key][strike]["sell_vol"] += vol
 
-# Start the simulator in the background
+# Start the simulator!
 threading.Thread(target=weekend_market_simulator, daemon=True).start()
+
 # ══════════════════════════════════════════════════════════
 #  🟢 USER PROFILE ROUTE
 # ══════════════════════════════════════════════════════════
