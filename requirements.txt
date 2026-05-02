@@ -10,4 +10,4 @@ dnspython==2.6.1
 razorpay==1.4.1
 APScheduler==3.10.4
 pytz
-pip install upstox-python-sdk
+upstox-python-sdk
