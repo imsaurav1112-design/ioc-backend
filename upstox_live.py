@@ -40,11 +40,8 @@ CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 # ══════════════════════════════════════════════════════════
 #  🔑 CONFIGURATION & CLOUD SETUP
 # ══════════════════════════════════════════════════════════
-API_KEY      = "3e51765a-3794-41ab-b3c9-4a88e0d55e30"
-API_SECRET   = "1ky9l299rf"
-REDIRECT_URI = "https://ioc-backend-kq9x.onrender.com/callback"
-BASE_URL     = "https://api.upstox.com/v2"
-_access_token = None
+# The 1-Year Analytics Token replaces the entire OAuth login system
+ANALYTICS_TOKEN = os.environ.get("UPSTOX_ANALYTICS_TOKEN")
 
 def get_ist_now():
     return datetime.utcnow() + timedelta(hours=5, minutes=30)
@@ -159,10 +156,7 @@ try:
 except Exception as e: pass
 
 from urllib.parse import quote_plus
-DB_USERNAME = quote_plus("insideowl")
-DB_PASSWORD = quote_plus("K@vy4120422")
-MONGO_URI = f"mongodb+srv://{DB_USERNAME}:{DB_PASSWORD}@ioc.ecqcgvo.mongodb.net/?appName=ioc"
-
+MONGO_URI = os.environ.get("MONGO_URI")
 try:
     mongo_client = MongoClient(MONGO_URI)
     db = mongo_client["ioc_terminal"]
@@ -176,9 +170,10 @@ try:
     history_col.create_index("createdAt", expireAfterSeconds=3456000)
 except Exception as e: pass
 
-RZP_KEY_ID = "rzp_test_ShbvbudW5LV1v3"
-RZP_KEY_SECRET = "Yz6P5jckKk6OyfuqvZ21YCXG"
-RZP_WEBHOOK_SECRET = "ioc_secure_webhook_2026" 
+RZP_KEY_ID = os.environ.get("RZP_KEY_ID")
+RZP_KEY_SECRET = os.environ.get("RZP_KEY_SECRET")
+RZP_WEBHOOK_SECRET = os.environ.get("RZP_WEBHOOK_SECRET")
+
 rzp_client = razorpay.Client(auth=(RZP_KEY_ID, RZP_KEY_SECRET))
 
 def require_firebase_auth(f):
@@ -539,8 +534,8 @@ def email_daily_trades():
     today_str = now.strftime("%Y-%m-%d")
     
     # ⚠️ EDIT THIS SECTION: Put your actual email and app password here ⚠️
-    SENDER_EMAIL = "greekcalculator@gmail.com"
-    SENDER_APP_PASSWORD = "llax olgz jdlh nybl"
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
+SENDER_APP_PASSWORD = os.environ.get("SENDER_APP_PASSWORD")
     
     try:
         all_trades = list(paper_trades_col.find({"date": today_str}))
