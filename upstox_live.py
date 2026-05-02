@@ -1021,43 +1021,76 @@ def get_footprint():
 # ══════════════════════════════════════════════════════════
 import time
 import random
+from datetime import datetime
+import threading
 
-def weekend_market_simulator():
-    """Pumps fake volume into the dictionary when market is closed"""
-    global footprint_candles
-    print("🟢 WEEKEND SIMULATOR BOOTING UP...")
+simulated_candles = {}
+
+def get_current_candle_time():
+    now = datetime.now()
+    minute = (now.minute // 5) * 5
+    candle_time = now.replace(minute=minute, second=0, microsecond=0)
+    return candle_time.strftime("%H:%M")
+
+def realistic_market_simulator():
+    """Generates realistic market trends (higher-highs, lower-lows)"""
+    global simulated_candles
+    print("🟢 REALISTIC MARKET SIMULATOR BOOTING UP...")
     
     current_price = 22500
+    market_trend = 1 # 1 = Bullish, -1 = Bearish, 0 = Ranging
+    trend_duration = 0
     
     while True:
-        time.sleep(1) # Generate 1 fake trade per second
-        
+        time.sleep(1) # Fake trade speed
         candle_key = get_current_candle_time()
         
-        if candle_key not in footprint_candles:
-            footprint_candles[candle_key] = {}
-            print(f"🕯️ New 5-Min Candle Created: {candle_key}")
+        if candle_key not in simulated_candles:
+            simulated_candles[candle_key] = {}
             
-        # Simulate price movement
-        current_price += random.choice([-1, 0, 1])
-        strike = str(current_price)
-        
-        if strike not in footprint_candles[candle_key]:
-            footprint_candles[candle_key][strike] = {"buy_vol": 0, "sell_vol": 0}
+        # State Machine: Change the market trend every 30-60 seconds
+        trend_duration += 1
+        if trend_duration > random.randint(30, 60):
+            market_trend = random.choice([1, 1, 0, -1, -1]) # Slightly favors trending
+            trend_duration = 0
             
-        # Simulate Institutional Volume
-        vol = random.randint(10, 100)
-        if random.random() > 0.85: 
-            vol = random.randint(300, 800) # Fake imbalance spike
-            
-        if random.random() > 0.5:
-            footprint_candles[candle_key][strike]["buy_vol"] += vol
+        # Move price according to trend
+        if market_trend == 1:
+            step = random.choice([0, 5, 5, 10]) # Higher Highs
+        elif market_trend == -1:
+            step = random.choice([0, -5, -5, -10]) # Lower Lows
         else:
-            footprint_candles[candle_key][strike]["sell_vol"] += vol
+            step = random.choice([-5, 0, 5]) # Ranging
+            
+        current_price += step
+        
+        # Round to nearest Nifty tick size (5)
+        rounded_price = str(round(current_price / 5) * 5)
+        
+        if rounded_price not in simulated_candles[candle_key]:
+            simulated_candles[candle_key][rounded_price] = {"buy_vol": 0, "sell_vol": 0}
+            
+        # Simulate Institutional Volume based on trend
+        vol = random.randint(10, 150)
+        
+        # Inject Imbalances during strong moves
+        if random.random() > 0.8:
+            vol = random.randint(400, 1500)
+            
+        # In an uptrend, aggressive buyers (Ask) dominate. In downtrend, sellers (Bid) dominate.
+        if market_trend == 1:
+            simulated_candles[candle_key][rounded_price]["buy_vol"] += int(vol * random.uniform(1.0, 1.5))
+            simulated_candles[candle_key][rounded_price]["sell_vol"] += int(vol * random.uniform(0.1, 0.5))
+        elif market_trend == -1:
+            simulated_candles[candle_key][rounded_price]["sell_vol"] += int(vol * random.uniform(1.0, 1.5))
+            simulated_candles[candle_key][rounded_price]["buy_vol"] += int(vol * random.uniform(0.1, 0.5))
+        else:
+            if random.random() > 0.5:
+                simulated_candles[candle_key][rounded_price]["buy_vol"] += vol
+            else:
+                simulated_candles[candle_key][rounded_price]["sell_vol"] += vol
 
-# Start the simulator!
-threading.Thread(target=weekend_market_simulator, daemon=True).start()
-
+threading.Thread(target=realistic_market_simulator, daemon=True).start()
 # ══════════════════════════════════════════════════════════
 #  🟢 USER PROFILE ROUTE
 # ══════════════════════════════════════════════════════════
