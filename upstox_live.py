@@ -1095,13 +1095,15 @@ def user_profile():
             expiry_str = expiry_val.strftime("%Y-%m-%d") if hasattr(expiry_val, 'strftime') else str(expiry_val) if expiry_val else None
 
             # 3. Return the real database values!
-            return jsonify({
+           return jsonify({
                 "email": user_doc.get("email", request.user.get("email", "")),
-                "tier": user_doc.get("tier", "free"),
+                "tier": user_doc.get("tier", "free"),  
+                "plan": user_doc.get("tier", "free"),  
                 "name": user_doc.get("name", ""),
                 "referral_code": user_doc.get("referral_code", ""),
                 "wallet_balance": float(user_doc.get("wallet_balance", 0.00)),
-                "expiry_date": expiry_str
+                "expiry_date": expiry_str,
+                "expiry": expiry_str                 
             })
         else:
             # Fallback if a brand new user hasn't been added to the database yet
