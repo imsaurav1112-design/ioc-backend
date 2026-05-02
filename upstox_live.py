@@ -254,7 +254,7 @@ def require_firebase_auth(f):
     return decorated_function
 
 def auth_headers(): 
-    return {"Authorization": f"Bearer {_access_token}", "Accept": "application/json"}
+    return {"Authorization": f"Bearer {ANALYTICS_TOKEN}", "Accept": "application/json"}
 
 # ══════════════════════════════════════════════════════════
 #  🟢 INSTITUTIONAL BLACK-SCHOLES SEESAW & GREEKS ENGINE
@@ -722,8 +722,9 @@ def fetch_and_record(symbol):
 def trigger_record():
     now = get_ist_now()
     
-    global _access_token
-    if not _access_token: load_saved_token()
+    # ✅ Securely check the new Analytics Token
+    if not ANALYTICS_TOKEN:
+        return jsonify({"status": "blocked", "reason": "no_analytics_token"}), 403
     
     is_weekday = now.weekday() < 5
     is_market_open = (
@@ -731,9 +732,6 @@ def trigger_record():
         (now.hour > 9 and now.hour < 15) or 
         (now.hour == 15 and now.minute <= 30)
     )
-    
-    if not _access_token:
-        return jsonify({"status": "blocked", "reason": "no_token"}), 403
 
     if is_weekday and is_market_open:
         try:
@@ -1119,9 +1117,15 @@ def user_profile():
         print("Profile Fetch Error:", e)
         return jsonify({"error": str(e)}), 500
 
-# KEEP THIS EXACTLY AS IT WAS:
+# ══════════════════════════════════════════════════════════
+#  🚀 SERVER BOOT SEQUENCE
+# ══════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    load_saved_token()
-    print("\n Server Running\n" + "-" * 45)
-    app.run(port=5001, debug=False)
+    if not ANALYTICS_TOKEN:
+        print("⚠️ WARNING: UPSTOX_ANALYTICS_TOKEN is missing from environment variables!")
     
+    print("\n" + "=" * 45)
+    print(" 🦉 InsiderOwl Live Backend Running")
+    print("=" * 45 + "\n")
+    
+    app.run(port=5001, debug=False)
