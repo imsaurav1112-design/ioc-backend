@@ -965,19 +965,22 @@ def start_footprint_streamer():
         print("Footprint Streamer Crash:", e)
 
 @app.route("/api/footprint", methods=['GET', 'OPTIONS'])
-@require_firebase_auth
 def get_footprint():
+    # 1. Let the browser's CORS preflight check pass through safely!
     if request.method == 'OPTIONS': 
         return jsonify({"status": "ok"}), 200
     
+    # 2. Basic security check to ensure they are logged in on the frontend
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Unauthorized Access"}), 401
+    
+    # 3. Send the time-based candles back to the frontend
     return jsonify({
         "status": "success",
         "instrument": "NIFTY",
-        "data": footprint_candles # We now send ALL candles to the frontend!
+        "data": footprint_candles 
     })
-
-import threading
-threading.Thread(target=start_footprint_streamer, daemon=True).start()
 
 @app.route("/user-profile", methods=['GET', 'OPTIONS'])
 @require_firebase_auth
