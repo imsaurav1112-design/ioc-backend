@@ -405,8 +405,7 @@ def calculate_coa(chain_rows, symbol, expiry):
 # ══════════════════════════════════════════════════════════
 @app.route("/health")
 def health(): 
-    is_auth = _access_token is not None
-    if not is_auth: is_auth = load_saved_token()
+    is_auth = ANALYTICS_TOKEN is not None
     return jsonify({"status": "ok", "authenticated": is_auth})
 
 @app.route("/expiry-dates", methods=['GET', 'OPTIONS'], strict_slashes=False)
@@ -706,29 +705,6 @@ def trigger_record():
             return jsonify({"status": "error", "message": str(e)}), 500
     
     return jsonify({"status": "sleeping", "message": f"Market Closed (Server Time: {now.strftime('%H:%M:%S')} IST)"}), 200
-
-# ══════════════════════════════════════════════════════════
-#  🟢 SERVER AUTH & USER MANAGEMENT
-# ══════════════════════════════════════════════════════════
-def load_saved_token():
-    global _access_token
-    try:
-        token_doc = sys_col.find_one({"_id": "upstox_auth"})
-        if token_doc: 
-            _access_token = token_doc.get("access_token", "")
-            return True
-        return False
-    except: return False
-
-def save_token(token):
-    global _access_token
-    if not token or token == "None": return False
-    _access_token = token
-    try:
-        sys_col.update_one({"_id": "upstox_auth"}, {"$set": {"access_token": token, "date": get_ist_now().strftime("%Y-%m-%d")}}, upsert=True)
-        return True
-    except: return False
-
 
 from datetime import timedelta
 
