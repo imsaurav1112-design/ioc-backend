@@ -12,3 +12,4 @@ APScheduler==3.10.4
 pytz
 upstox-python-sdk
 Flask-Limiter
+jsonschema
