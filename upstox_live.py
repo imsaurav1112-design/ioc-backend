@@ -5,7 +5,7 @@ Streamlined Core Indices Version.
 IST Timezone enforced.
 Includes Paper Trading Database & 3:30 PM Auto-Emailer.
 """
-
+from jsonschema import validate, ValidationError
 import heapq
 import concurrent.futures
 import os, sys, time, json, requests
@@ -745,20 +745,27 @@ def trigger_record():
     
     return jsonify({"status": "sleeping", "message": f"Market Closed (Server Time: {now.strftime('%H:%M:%S')} IST)"}), 200
 
+
 from datetime import timedelta
 
 @app.route("/pay-with-wallet", methods=['POST', 'OPTIONS'])
-@limiter.limit("5 per minute") # Max 5 attempts per minute per user
+@limiter.limit("5 per minute") 
 @require_firebase_auth
 def pay_with_wallet():
     if request.method == 'OPTIONS': 
         return jsonify({"status": "ok"}), 200
         
     try:
-# SECURITY FIX 1: Prevent NoSQL Injection
+        # 🛡️ STRICT VALIDATION: Drop bad payloads instantly
+        try:
+            validate(instance=request.json, schema=PLAN_SCHEMA)
+        except ValidationError as e:
+            return jsonify({"error": f"Invalid request format: {e.message}"}), 400
+            
         uid = str(request.user.get('uid'))
         data = request.json
         plan_id = data.get("plan")
+        
         # ✅ SAFE: We completely ignore the client's cost parameter
         
         # 1. Server determines the cost strictly based on the plan ID
@@ -815,21 +822,57 @@ def pay_with_wallet():
     except Exception as e:
         print("Wallet Payment Error:", e)
         return jsonify({"error": str(e)}), 500
+
+# ══════════════════════════════════════════════════════════
+#  🟢 STRICT API PAYLOAD SCHEMAS
+# ══════════════════════════════════════════════════════════
+# We use "additionalProperties": False to prevent hackers from sending 
+# massive payloads with fake keys to crash the server memory.
+
+PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "plan": {"type": "string", "enum": ["1_month", "3_months", "6_months"]},
+    },
+    "required": ["plan"],
+    "additionalProperties": False 
+}
+
+VERIFY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "plan": {"type": "string", "enum": ["1_month", "3_months", "6_months"]},
+        "razorpay_payment_id": {"type": "string", "minLength": 5},
+        "razorpay_order_id": {"type": "string", "minLength": 5},
+        "razorpay_signature": {"type": "string", "minLength": 10}
+    },
+    "required": ["plan", "razorpay_payment_id", "razorpay_order_id", "razorpay_signature"],
+    "additionalProperties": False
+}
+
 # ══════════════════════════════════════════════════════════
 #  🟢 RAZORPAY PAYMENT ROUTES
 # ══════════════════════════════════════════════════════════
 from datetime import timedelta
 
 @app.route("/create-order", methods=['POST', 'OPTIONS'])
-@limiter.limit("10 per minute") # Max 10 order generations per minute
+@limiter.limit("10 per minute")
 @require_firebase_auth
 def create_order():
     if request.method == 'OPTIONS': 
         return jsonify({"status": "ok"}), 200
         
     try:
+        # 🛡️ STRICT VALIDATION
+        try:
+            validate(instance=request.json, schema=PLAN_SCHEMA)
+        except ValidationError as e:
+            return jsonify({"error": f"Invalid request format: {e.message}"}), 400
+            
         data = request.json
-       plan_id = data.get("plan")
+        plan_id = data.get("plan")
+        
+        # ... (Rest of your Razorpay order logic) ...
         
         # 1. Server-side price validation
         plan_prices = {"1_month": 249, "3_months": 599, "6_months": 999}
@@ -862,15 +905,23 @@ def create_order():
 
 
 @app.route("/verify-payment", methods=['POST', 'OPTIONS'])
-@limiter.limit("5 per minute") # Max 5 verification attempts per minute
+@limiter.limit("5 per minute")
 @require_firebase_auth
 def verify_payment():
     if request.method == 'OPTIONS': 
         return jsonify({"status": "ok"}), 200
         
     try:
+        # 🛡️ STRICT VALIDATION: Using the VERIFY_SCHEMA here
+        try:
+            validate(instance=request.json, schema=VERIFY_SCHEMA)
+        except ValidationError as e:
+            return jsonify({"error": f"Invalid request format: {e.message}"}), 400
+            
         uid = str(request.user.get('uid'))
         data = request.json
+        
+        # ... (Rest of your signature verification logic) ...
         
         # 1. Extract Razorpay signature details
         payment_id = data.get("razorpay_payment_id")
