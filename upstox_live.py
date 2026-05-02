@@ -1081,35 +1081,35 @@ def get_footprint():
 def user_profile():
     if request.method == 'OPTIONS':
         return jsonify({"status": "ok"}), 200
-        
     try:
         uid = request.user.get('uid')
         user_doc = users_col.find_one({"_id": uid})
         
-        if user_doc:
-            expiry_val = user_doc.get("expiry")
-            expiry_str = expiry_val.strftime("%Y-%m-%d") if hasattr(expiry_val, 'strftime') else str(expiry_val) if expiry_val else None
+        if not user_doc:
+            return jsonify({"email": request.user.get("email", ""), "tier": "free", "plan": "free"}), 200
 
-            return jsonify({
-                "email": user_doc.get("email", request.user.get("email", "")),
-                "tier": user_doc.get("tier", "free"),
-                "plan": user_doc.get("tier", "free"),
-                "name": user_doc.get("name", ""),
-                "referral_code": user_doc.get("referral_code", ""),
-                "wallet_balance": float(user_doc.get("wallet_balance", 0.00)),
-                "expiry_date": expiry_str,
-                "expiry": expiry_str
-            })
-        else:
-            return jsonify({
-                "email": request.user.get("email", ""),
-                "tier": "free",
-                "plan": "free"
-            })
-            
+        # Extremely safe date parsing
+        exp = user_doc.get("expiry")
+        exp_str = exp.strftime("%Y-%m-%d") if hasattr(exp, 'strftime') else "N/A"
+
+        # Extremely safe balance parsing
+        try:
+            bal = float(user_doc.get("wallet_balance", 0))
+        except:
+            bal = 0.0
+
+        return jsonify({
+            "email": user_doc.get("email", request.user.get("email", "")),
+            "tier": user_doc.get("tier", "free"),
+            "plan": user_doc.get("tier", "free"),
+            "name": user_doc.get("name", "User"),
+            "wallet_balance": bal,
+            "expiry_date": exp_str,
+            "expiry": exp_str
+        }), 200
     except Exception as e:
-        print("Profile Fetch Error:", e)
-        return jsonify({"error": str(e)}), 500
+        print(f"CRITICAL PROFILE ERROR: {e}") # This will now show up in Render logs
+        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
 
 # ══════════════════════════════════════════════════════════
 #  🚀 SERVER BOOT SEQUENCE
