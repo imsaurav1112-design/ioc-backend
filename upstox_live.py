@@ -982,6 +982,52 @@ def get_footprint():
         "data": footprint_candles 
     })
 
+# ══════════════════════════════════════════════════════════
+#  🟢 V-FOOTPRINT TEST CODE 
+# ══════════════════════════════════════════════════════════
+    import time
+import random
+
+def weekend_market_simulator():
+    """Generates fake Nifty trades when the real market is closed for UI testing."""
+    global footprint_candles
+    print("\n🟢 STARTING WEEKEND FOOTPRINT SIMULATOR...\n")
+    
+    current_price = 22500 # Starting base price for Nifty
+    
+    while True:
+        time.sleep(0.8) # Generate a fake trade every 0.8 seconds
+        
+        # 1. Get the current candle time
+        candle_key = get_current_candle_time()
+        if candle_key not in footprint_candles:
+            footprint_candles[candle_key] = {}
+            
+        # 2. Simulate price movement (Up 1, Down 1, or stay flat)
+        current_price += random.choice([-1, 0, 1])
+        strike = str(current_price)
+        
+        if strike not in footprint_candles[candle_key]:
+            footprint_candles[candle_key][strike] = {"buy_vol": 0, "sell_vol": 0}
+            
+        # 3. Simulate massive institutional volume spikes
+        vol = random.randint(10, 100)
+        
+        # Randomly create imbalances (300% differences) to test your neon UI colors
+        if random.random() > 0.85: 
+            vol = random.randint(300, 800) 
+            
+        if random.random() > 0.5:
+            footprint_candles[candle_key][strike]["buy_vol"] += vol
+        else:
+            footprint_candles[candle_key][strike]["sell_vol"] += vol
+
+# Start the simulator in the background
+threading.Thread(target=weekend_market_simulator, daemon=True).start()
+# ══════════════════════════════════════════════════════════
+#  🟢 USER PROFILE ROUTE
+# ══════════════════════════════════════════════════════════
+
 @app.route("/user-profile", methods=['GET', 'OPTIONS'])
 @require_firebase_auth
 def user_profile():
