@@ -30,7 +30,6 @@ from firebase_admin import credentials, auth
 import razorpay
 import threading
 import asyncio
-from upstox_client.websocket.market_data import MarketDataStreamer
 
 # Global dictionary to store our live Footprint matrix
 live_footprint_data = {}
@@ -887,77 +886,63 @@ def verify_payment():
 #  🟢 LIVE FOOTPRINT ENGINE & ROUTE
 # ══════════════════════════════════════════════════════════
 
+import upstox_client
+
 def start_footprint_streamer():
     global _access_token, live_footprint_data
     if not _access_token:
         print("Waiting for access token to start Footprint engine...")
         return
 
-    # Use the official Upstox WebSocket Streamer
-    streamer = MarketDataStreamer(
-        OAUTH2_BEARER_TOKEN=_access_token,
-        client_id=API_KEY,
-        client_secret=API_SECRET,
-        redirect_uri=REDIRECT_URI
-    )
-    
-    # We want NIFTY FUTURES (Current Month). You might need to update this key dynamically on expiry!
-    # For now, we will use the continuous Nifty 50 Index for demonstration.
-    instrument = "NSE_INDEX|Nifty 50"
+    try:
+        # 1. Setup the new Upstox API Configuration
+        configuration = upstox_client.Configuration()
+        configuration.access_token = _access_token
+        api_client = upstox_client.ApiClient(configuration)
+        
+        instrument = "NSE_INDEX|Nifty 50"
 
-    def on_message(message):
-        try:
-            # Parse the incoming trade data from the Upstox SDK
-            if "feeds" in message and instrument in message["feeds"]:
-                feed = message["feeds"][instrument]
-                
-                if "ff" in feed and "marketFF" in feed["ff"]:
-                    market_data = feed["ff"]["marketFF"]
+        # 2. Initialize the official V3 Streamer
+        streamer = upstox_client.MarketDataStreamerV3(api_client, [instrument], "full")
+
+        # 3. The logic that parses the data
+        def on_message(message):
+            try:
+                if "feeds" in message and instrument in message["feeds"]:
+                    feed = message["feeds"][instrument]
                     
-                    ltp = float(market_data["ltpc"]["ltp"])
-                    volume = int(market_data["ltpc"].get("ltq", 0))
-                    
-                    # We only care if actual volume was traded
-                    if volume > 0 and "marketLevel" in market_data:
-                        bids_asks = market_data["marketLevel"].get("bidAskQuote", [])
-                        if len(bids_asks) > 0:
-                            top_bid = float(bids_asks[0]["bp"])
-                            top_ask = float(bids_asks[0]["ap"])
-                            
-                            # Round LTP to nearest whole number for clean charting
-                            rounded_price = round(ltp)
-                            
-                            if str(rounded_price) not in live_footprint_data:
-                                live_footprint_data[str(rounded_price)] = {"buy_vol": 0, "sell_vol": 0}
+                    if "ff" in feed and "marketFF" in feed["ff"]:
+                        market_data = feed["ff"]["marketFF"]
+                        
+                        ltp = float(market_data["ltpc"]["ltp"])
+                        volume = int(market_data["ltpc"].get("ltq", 0))
+                        
+                        if volume > 0 and "marketLevel" in market_data:
+                            bids_asks = market_data["marketLevel"].get("bidAskQuote", [])
+                            if len(bids_asks) > 0:
+                                top_bid = float(bids_asks[0]["bp"])
+                                top_ask = float(bids_asks[0]["ap"])
                                 
-                            # The Footprint Classification
-                            if ltp >= top_ask:
-                                live_footprint_data[str(rounded_price)]["buy_vol"] += volume
-                            elif ltp <= top_bid:
-                                live_footprint_data[str(rounded_price)]["sell_vol"] += volume
+                                rounded_price = round(ltp)
                                 
-        except Exception as e:
-            pass # Ignore malformed ticks to keep stream alive
+                                if str(rounded_price) not in live_footprint_data:
+                                    live_footprint_data[str(rounded_price)] = {"buy_vol": 0, "sell_vol": 0}
+                                    
+                                if ltp >= top_ask:
+                                    live_footprint_data[str(rounded_price)]["buy_vol"] += volume
+                                elif ltp <= top_bid:
+                                    live_footprint_data[str(rounded_price)]["sell_vol"] += volume
+                                    
+            except Exception as e:
+                pass # Ignore malformed ticks to keep stream alive
 
-    streamer.on("message", on_message)
-    streamer.connect()
-
-# Create an API route so the frontend can grab the data
-@app.route("/api/footprint", methods=['GET', 'OPTIONS'])
-@require_firebase_auth
-def get_footprint():
-    if request.method == 'OPTIONS': 
-        return jsonify({"status": "ok"}), 200
-    
-    # Send the dictionary to the frontend!
-    return jsonify({
-        "status": "success",
-        "instrument": "NIFTY",
-        "data": live_footprint_data
-    })
-
-# Start the background thread when the server boots
-threading.Thread(target=start_footprint_streamer, daemon=True).start()
+        streamer.on("message", on_message)
+        
+        print("⚡ Footprint V3 Streamer Connecting...")
+        streamer.connect()
+        
+    except Exception as e:
+        print("Footprint Streamer Crash:", e)
 
 @app.route("/user-profile", methods=['GET', 'OPTIONS'])
 @require_firebase_auth
