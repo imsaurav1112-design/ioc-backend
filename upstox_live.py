@@ -11,6 +11,12 @@ from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+
+# 🟢 NEW: Security & Rate Limiting Imports
+from werkzeug.middleware.proxy_fix import ProxyFix
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
 import numpy as np
 from scipy.stats import norm
 from scipy.optimize import brentq, fsolve
@@ -35,6 +41,10 @@ import asyncio
 live_footprint_data = {}
 
 app = Flask(__name__)
+
+# SECURITY FIX: Tell Flask it is sitting behind Render's proxy so it gets the REAL user IPs
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
 # SECURITY FIX: Only allow your official frontend domain to access the API
 ALLOWED_ORIGINS = [
     "https://imsaurav1112-design.github.io",  # Your Production Frontend
@@ -42,14 +52,27 @@ ALLOWED_ORIGINS = [
     "http://localhost:3000"
 ]
 CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
+
+# SECURITY FIX: Initialize the Rate Limiter globally for the app
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["1000 per day", "200 per hour"] # Generous global default
+)
 # ══════════════════════════════════════════════════════════
 #  🔑 CONFIGURATION & CLOUD SETUP
 # ══════════════════════════════════════════════════════════
 # The 1-Year Analytics Token replaces the entire OAuth login system
 ANALYTICS_TOKEN = os.environ.get("UPSTOX_ANALYTICS_TOKEN")
 
+import pytz
+
+# Define the IST timezone globally
+IST = pytz.timezone('Asia/Kolkata')
+
 def get_ist_now():
-    return datetime.utcnow() + timedelta(hours=5, minutes=30)
+    """Returns a timezone-aware datetime object for precise Indian Standard Time."""
+    return datetime.now(IST)
 
 SYMBOL_MAP = {
     "NIFTY":      {"instrument_key": "NSE_INDEX|Nifty 50",            "lot": 75,  "step": 50},
@@ -538,19 +561,22 @@ def email_daily_trades():
     now = get_ist_now()
     today_str = now.strftime("%Y-%m-%d")
     
-    # ⚠️ EDIT THIS SECTION: Put your actual email and app password here ⚠️
-SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
-SENDER_APP_PASSWORD = os.environ.get("SENDER_APP_PASSWORD")
+    SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
+    SENDER_APP_PASSWORD = os.environ.get("SENDER_APP_PASSWORD")
     
     try:
-        all_trades = list(paper_trades_col.find({"date": today_str}))
+        # DATA FIX 1: Only pick up trades that haven't been emailed yet
+        all_trades = list(paper_trades_col.find({"date": today_str, "emailed": {"$ne": True}}))
+        
         if not all_trades:
-            return jsonify({"status": "sleeping", "message": "No trades to email today."}), 200
+            return jsonify({"status": "sleeping", "message": "No new trades to email today."}), 200
             
         users = set(t.get("user_email") for t in all_trades if t.get("user_email"))
+        trade_ids_processed = [] # Keep track of exact trades we are emailing
         
         for email in users:
             user_trades = [t for t in all_trades if t.get("user_email") == email]
+            trade_ids_processed.extend([t["_id"] for t in user_trades])
             
             html_table = f"<h2>Your Paper Trades for {today_str}</h2><table border='1' cellpadding='8' style='border-collapse: collapse;'>"
             html_table += "<tr><th>Time</th><th>Symbol</th><th>Strike</th><th>Type</th><th>Entry</th><th>SL</th><th>Target</th></tr>"
@@ -570,14 +596,18 @@ SENDER_APP_PASSWORD = os.environ.get("SENDER_APP_PASSWORD")
                 server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
                 server.send_message(msg)
 
-        # Wipe today's trades after emailing
-        paper_trades_col.delete_many({}) 
+        # DATA FIX 2: Mark ONLY the processed trades as emailed. DO NOT DELETE.
+        if trade_ids_processed:
+            paper_trades_col.update_many(
+                {"_id": {"$in": trade_ids_processed}},
+                {"$set": {"emailed": True, "emailed_at": datetime.utcnow()}}
+            )
         
-        return jsonify({"status": "success", "message": f"Emailed {len(users)} users and wiped today's trades."})
+        return jsonify({"status": "success", "message": f"Emailed {len(users)} users and safely archived {len(trade_ids_processed)} trades."})
         
     except Exception as e:
+        print("Email Cron Error:", e)
         return jsonify({"error": str(e)}), 500
-
 # ══════════════════════════════════════════════════════════
 #  🟢 THE EXTERNAL CRON ENGINE (HISTORY RECORDING)
 # ══════════════════════════════════════════════════════════
@@ -703,24 +733,27 @@ def save_token(token):
 from datetime import timedelta
 
 @app.route("/pay-with-wallet", methods=['POST', 'OPTIONS'])
+@limiter.limit("5 per minute") # Max 5 attempts per minute per user
 @require_firebase_auth
 def pay_with_wallet():
     if request.method == 'OPTIONS': 
         return jsonify({"status": "ok"}), 200
         
     try:
-        # SECURITY FIX 1: Prevent NoSQL Injection
+# SECURITY FIX 1: Prevent NoSQL Injection
         uid = str(request.user.get('uid'))
         data = request.json
         plan_id = data.get("plan")
-        cost = float(data.get("cost", 0))
+        # ✅ SAFE: We completely ignore the client's cost parameter
         
-        # 1. Validate the plan costs strictly on the backend
+        # 1. Server determines the cost strictly based on the plan ID
         plan_prices = {"1_month": 249, "3_months": 599, "6_months": 999}
         plan_days = {"1_month": 30, "3_months": 90, "6_months": 180}
         
-        if plan_id not in plan_prices or cost != plan_prices[plan_id]:
-            return jsonify({"error": "Invalid plan or price manipulation detected."}), 400
+        if plan_id not in plan_prices:
+            return jsonify({"error": "Invalid plan selected."}), 400
+            
+        cost = plan_prices[plan_id] # The server sets the absolute truth here
             
         # 2. Fetch user to check current tier/expiry for date math
         user_doc = users_col.find_one({"_id": uid})
@@ -773,6 +806,7 @@ def pay_with_wallet():
 from datetime import timedelta
 
 @app.route("/create-order", methods=['POST', 'OPTIONS'])
+@limiter.limit("10 per minute") # Max 10 order generations per minute
 @require_firebase_auth
 def create_order():
     if request.method == 'OPTIONS': 
@@ -780,14 +814,14 @@ def create_order():
         
     try:
         data = request.json
-        plan_id = data.get("plan")
+       plan_id = data.get("plan")
         
         # 1. Server-side price validation
         plan_prices = {"1_month": 249, "3_months": 599, "6_months": 999}
         if plan_id not in plan_prices:
             return jsonify({"error": "Invalid Plan Selected"}), 400
             
-        cost_inr = plan_prices[plan_id]
+        cost_inr = plan_prices[plan_id] # ✅ Secure pattern
         
         # 2. Razorpay uses 'paise' (Multiply INR by 100)
         amount_in_paise = int(cost_inr * 100)
@@ -813,6 +847,7 @@ def create_order():
 
 
 @app.route("/verify-payment", methods=['POST', 'OPTIONS'])
+@limiter.limit("5 per minute") # Max 5 verification attempts per minute
 @require_firebase_auth
 def verify_payment():
     if request.method == 'OPTIONS': 
@@ -872,31 +907,34 @@ def verify_payment():
         return jsonify({"error": str(e)}), 500
 
 # ══════════════════════════════════════════════════════════
-#  🟢 LIVE FOOTPRINT ENGINE & ROUTE
+#  🟢 LIVE FOOTPRINT ENGINE & ROUTE (PRODUCTION)
 # ══════════════════════════════════════════════════════════
-
 import upstox_client
+import threading
+from datetime import datetime
 
-# This now stores MULTIPLE candles! Format: {"10:15": {"22500": {"buy_vol": 100, "sell_vol": 50}}}
+# Stores MULTIPLE candles! Format: {"10:15": {"22500": {"buy_vol": 100, "sell_vol": 50}}}
 footprint_candles = {}
 TIMEFRAME_MINUTES = 5
 
 def get_current_candle_time():
-    """Rounds the current time down to the nearest 5-minute block"""
-    now = datetime.now()
+    """Rounds the current time down to the nearest 5-minute block using IST"""
+    now = get_ist_now() # SECURITY FIX: Replaced datetime.now()
     minute = (now.minute // TIMEFRAME_MINUTES) * TIMEFRAME_MINUTES
     candle_time = now.replace(minute=minute, second=0, microsecond=0)
     return candle_time.strftime("%H:%M")
 
 def start_footprint_streamer():
-    global _access_token, footprint_candles
-    if not _access_token:
-        print("Waiting for access token to start Footprint engine...")
+    global footprint_candles
+    
+    # SECURITY FIX: Use the 1-Year Analytics Token, not the old access token
+    if not ANALYTICS_TOKEN:
+        print("🚨 ERROR: No Analytics Token found! Footprint engine cannot start.")
         return
 
     try:
         configuration = upstox_client.Configuration()
-        configuration.access_token = _access_token
+        configuration.access_token = ANALYTICS_TOKEN
         api_client = upstox_client.ApiClient(configuration)
         
         instrument = "NSE_INDEX|Nifty 50"
@@ -920,16 +958,16 @@ def start_footprint_streamer():
                                 top_ask = float(bids_asks[0]["ap"])
                                 rounded_price = round(ltp)
                                 
-                                # 1. Get the current 5-minute time block
+                                # 1. Get current 5-minute block
                                 candle_key = get_current_candle_time()
                                 
-                                # 2. If it's a new 5-minute candle, create it!
+                                # 2. Create new candle if needed
                                 if candle_key not in footprint_candles:
                                     footprint_candles[candle_key] = {}
                                     
-                                    # Optional: Prevent memory crashes by keeping only the last 12 candles (1 hour)
+                                    # Memory Management: Keep only last 12 candles (1 hour)
                                     if len(footprint_candles) > 12:
-                                        oldest_candle = list(footprint_candles.keys())[0]
+                                        oldest_candle = sorted(list(footprint_candles.keys()))[0]
                                         del footprint_candles[oldest_candle]
 
                                 current_matrix = footprint_candles[candle_key]
@@ -937,7 +975,7 @@ def start_footprint_streamer():
                                 if str(rounded_price) not in current_matrix:
                                     current_matrix[str(rounded_price)] = {"buy_vol": 0, "sell_vol": 0}
                                     
-                                # 3. Add the volume to the CURRENT 5-minute candle
+                                # 3. Classify and add volume
                                 if ltp >= top_ask:
                                     current_matrix[str(rounded_price)]["buy_vol"] += volume
                                 elif ltp <= top_bid:
@@ -947,139 +985,29 @@ def start_footprint_streamer():
                 pass 
 
         streamer.on("message", on_message)
-        print(f"⚡ Footprint Streamer Connecting ({TIMEFRAME_MINUTES}-Min Candles)...")
+        print(f"⚡ REAL Footprint Streamer Connecting ({TIMEFRAME_MINUTES}-Min Candles)...")
         streamer.connect()
         
     except Exception as e:
-        print("Footprint Streamer Crash:", e)
+        print("Footprint Streamer Crash (Reconnecting in 5s):", e)
+        time.sleep(5)
+        start_footprint_streamer()
 
-import time
-import random
-from datetime import datetime
+# Automatically boot the real engine in the background when the server starts
+threading.Thread(target=start_footprint_streamer, daemon=True).start()
 
-# Temporary Simulator Memory
-simulated_candles = {}
-
-def get_current_candle_time():
-    now = datetime.now()
-    minute = (now.minute // 5) * 5
-    candle_time = now.replace(minute=minute, second=0, microsecond=0)
-    return candle_time.strftime("%H:%M")
 
 @app.route("/api/footprint", methods=['GET', 'OPTIONS'])
 def get_footprint():
     if request.method == 'OPTIONS': 
         return jsonify({"status": "ok"}), 200
     
-    # --- WEEKEND SIMULATOR INJECTION ---
-    global simulated_candles
-    
-    # 1. Get current 5-min block
-    candle_key = get_current_candle_time()
-    
-    # 2. Start a new candle if needed
-    if candle_key not in simulated_candles:
-        simulated_candles[candle_key] = {}
-        # Pre-fill with a base price to simulate an orderbook
-        for i in range(-5, 6):
-            price = str(22500 + (i * 5))
-            simulated_candles[candle_key][price] = {"buy_vol": 0, "sell_vol": 0}
-
-    # 3. Simulate a random massive trade every time the frontend asks for data (every 2 seconds)
-    random_strike = str(22500 + (random.randint(-2, 2) * 5))
-    vol = random.randint(10, 150)
-    
-    # Create a giant imbalance 20% of the time
-    if random.random() > 0.8:
-        vol = random.randint(400, 1000)
-        
-    if random.random() > 0.5:
-        simulated_candles[candle_key][random_strike]["buy_vol"] += vol
-    else:
-        simulated_candles[candle_key][random_strike]["sell_vol"] += vol
-    # -----------------------------------
-
+    # Serve the REAL live data directly from the Upstox memory dictionary
     return jsonify({
         "status": "success",
         "instrument": "NIFTY",
-        "data": simulated_candles 
+        "data": footprint_candles 
     })
-
-# ══════════════════════════════════════════════════════════
-#  🟢 V-FOOTPRINT TEST CODE 
-# ══════════════════════════════════════════════════════════
-import time
-import random
-from datetime import datetime
-import threading
-
-simulated_candles = {}
-
-def get_current_candle_time():
-    now = datetime.now()
-    minute = (now.minute // 5) * 5
-    candle_time = now.replace(minute=minute, second=0, microsecond=0)
-    return candle_time.strftime("%H:%M")
-
-def realistic_market_simulator():
-    """Generates realistic market trends (higher-highs, lower-lows)"""
-    global simulated_candles
-    print("🟢 REALISTIC MARKET SIMULATOR BOOTING UP...")
-    
-    current_price = 22500
-    market_trend = 1 # 1 = Bullish, -1 = Bearish, 0 = Ranging
-    trend_duration = 0
-    
-    while True:
-        time.sleep(1) # Fake trade speed
-        candle_key = get_current_candle_time()
-        
-        if candle_key not in simulated_candles:
-            simulated_candles[candle_key] = {}
-            
-        # State Machine: Change the market trend every 30-60 seconds
-        trend_duration += 1
-        if trend_duration > random.randint(30, 60):
-            market_trend = random.choice([1, 1, 0, -1, -1]) # Slightly favors trending
-            trend_duration = 0
-            
-        # Move price according to trend
-        if market_trend == 1:
-            step = random.choice([0, 5, 5, 10]) # Higher Highs
-        elif market_trend == -1:
-            step = random.choice([0, -5, -5, -10]) # Lower Lows
-        else:
-            step = random.choice([-5, 0, 5]) # Ranging
-            
-        current_price += step
-        
-        # Round to nearest Nifty tick size (5)
-        rounded_price = str(round(current_price / 5) * 5)
-        
-        if rounded_price not in simulated_candles[candle_key]:
-            simulated_candles[candle_key][rounded_price] = {"buy_vol": 0, "sell_vol": 0}
-            
-        # Simulate Institutional Volume based on trend
-        vol = random.randint(10, 150)
-        
-        # Inject Imbalances during strong moves
-        if random.random() > 0.8:
-            vol = random.randint(400, 1500)
-            
-        # In an uptrend, aggressive buyers (Ask) dominate. In downtrend, sellers (Bid) dominate.
-        if market_trend == 1:
-            simulated_candles[candle_key][rounded_price]["buy_vol"] += int(vol * random.uniform(1.0, 1.5))
-            simulated_candles[candle_key][rounded_price]["sell_vol"] += int(vol * random.uniform(0.1, 0.5))
-        elif market_trend == -1:
-            simulated_candles[candle_key][rounded_price]["sell_vol"] += int(vol * random.uniform(1.0, 1.5))
-            simulated_candles[candle_key][rounded_price]["buy_vol"] += int(vol * random.uniform(0.1, 0.5))
-        else:
-            if random.random() > 0.5:
-                simulated_candles[candle_key][rounded_price]["buy_vol"] += vol
-            else:
-                simulated_candles[candle_key][rounded_price]["sell_vol"] += vol
-
-threading.Thread(target=realistic_market_simulator, daemon=True).start()
 # ══════════════════════════════════════════════════════════
 #  🟢 USER PROFILE ROUTE
 # ══════════════════════════════════════════════════════════
