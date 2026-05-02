@@ -6,6 +6,8 @@ IST Timezone enforced.
 Includes Paper Trading Database & 3:30 PM Auto-Emailer.
 """
 
+import heapq
+import concurrent.futures
 import os, sys, time, json, requests
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
@@ -154,12 +156,34 @@ def fetch_custom_mcx_chain(base_name, expiry_str, headers):
         if "PE" in types: keys_to_fetch.append(types["PE"]["key"])
     if not keys_to_fetch: return [], spot
     all_quotes = {}
+    
+    # 1. Break the massive list into chunks of 50
+    batches = [keys_to_fetch[i:i+50] for i in range(0, len(keys_to_fetch), 50)]
+    
+    # 2. Define the worker function that each thread will execute
+    def fetch_batch(batch_keys):
+        try:
+            url = "https://api.upstox.com/v2/market-quote/quotes"
+            r = requests.get(url, params={"instrument_key": ",".join(batch_keys)}, headers=headers, timeout=5)
+            if r.status_code == 200:
+                return r.json().get("data", {})
+        except Exception:
+            pass
+        return {}
+
+    # 3. Fire all requests simultaneously using a Thread Pool
     try:
-        for i in range(0, len(keys_to_fetch), 50):
-            batch = keys_to_fetch[i:i+50]
-            r = requests.get(f"{BASE_URL}/market-quote/quotes", params={"instrument_key": ",".join(batch)}, headers=headers)
-            if r.status_code == 200: all_quotes.update(r.json().get("data", {}))
-    except Exception as e: pass
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            # Submit all batches to the executor
+            futures = [executor.submit(fetch_batch, b) for b in batches]
+            
+            # As soon as any thread finishes, merge its data into our master dictionary
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if result:
+                    all_quotes.update(result)
+    except Exception as e:
+        print("MCX Threading Error:", e)
     raw_list = []
     for strike, types in opt_map.items():
         ce_data, pe_data = types.get("CE"), types.get("PE")
@@ -178,10 +202,16 @@ def fetch_custom_mcx_chain(base_name, expiry_str, headers):
 # ══════════════════════════════════════════════════════════
 #  🟢 FIREBASE & MONGODB SETUP
 # ══════════════════════════════════════════════════════════
+import sys
+
 try:
     cred = credentials.Certificate(os.path.join(os.getcwd(), 'firebase-admin.json'))
     firebase_admin.initialize_app(cred)
-except Exception as e: pass
+    print("🔥 Firebase Admin initialized successfully.")
+except Exception as e:
+    print(f"🚨 FATAL ERROR: Firebase initialization failed: {e}")
+    print("The server cannot run without Firebase. Shutting down...")
+    sys.exit(1)  # This tells Render to immediately crash the deployment and alert you
 
 from urllib.parse import quote_plus
 MONGO_URI = os.environ.get("MONGO_URI")
@@ -335,11 +365,20 @@ def inject_prz(chain_rows, expiry_date_str, step, spot_price):
 #  🟢 ADVANCED STATE-MACHINE & COA LOGIC
 # ══════════════════════════════════════════════════════════
 def evaluate_side(vols_dict, mem_side, side_name):
-    if not vols_dict: return {"strike": 0, "state": "Strong", "target_strike": 0, "pct": 0, "val": 0, "msg": ""}
-    sorted_vols = sorted(vols_dict.items(), key=lambda x: x[1], reverse=True)
-    max_strike, max_vol = sorted_vols[0]
-    sec_strike = sorted_vols[1][0] if len(sorted_vols) > 1 else 0
-    sec_vol = sorted_vols[1][1] if len(sorted_vols) > 1 else 0
+    if not vols_dict: 
+        return {"strike": 0, "state": "Strong", "target_strike": 0, "pct": 0, "val": 0, "msg": ""}
+        
+    # ⚡ PERFORMANCE FIX: Use heapq to find the top 2 values instantly 
+    # instead of sorting the entire dictionary. (O(N) instead of O(N log N))
+    top_2 = heapq.nlargest(2, vols_dict.items(), key=lambda x: x[1])
+    
+    max_strike, max_vol = top_2[0]
+    
+    if len(top_2) > 1:
+        sec_strike, sec_vol = top_2[1]
+    else:
+        sec_strike, sec_vol = 0, 0
+        
     pct = round((sec_vol / max_vol * 100), 2) if max_vol > 0 else 0
     
     if mem_side["base"] == 0:
