@@ -888,24 +888,31 @@ def verify_payment():
 
 import upstox_client
 
+# This now stores MULTIPLE candles! Format: {"10:15": {"22500": {"buy_vol": 100, "sell_vol": 50}}}
+footprint_candles = {}
+TIMEFRAME_MINUTES = 5
+
+def get_current_candle_time():
+    """Rounds the current time down to the nearest 5-minute block"""
+    now = datetime.now()
+    minute = (now.minute // TIMEFRAME_MINUTES) * TIMEFRAME_MINUTES
+    candle_time = now.replace(minute=minute, second=0, microsecond=0)
+    return candle_time.strftime("%H:%M")
+
 def start_footprint_streamer():
-    global _access_token, live_footprint_data
+    global _access_token, footprint_candles
     if not _access_token:
         print("Waiting for access token to start Footprint engine...")
         return
 
     try:
-        # 1. Setup the new Upstox API Configuration
         configuration = upstox_client.Configuration()
         configuration.access_token = _access_token
         api_client = upstox_client.ApiClient(configuration)
         
         instrument = "NSE_INDEX|Nifty 50"
-
-        # 2. Initialize the official V3 Streamer
         streamer = upstox_client.MarketDataStreamerV3(api_client, [instrument], "full")
 
-        # 3. The logic that parses the data
         def on_message(message):
             try:
                 if "feeds" in message and instrument in message["feeds"]:
@@ -922,27 +929,55 @@ def start_footprint_streamer():
                             if len(bids_asks) > 0:
                                 top_bid = float(bids_asks[0]["bp"])
                                 top_ask = float(bids_asks[0]["ap"])
-                                
                                 rounded_price = round(ltp)
                                 
-                                if str(rounded_price) not in live_footprint_data:
-                                    live_footprint_data[str(rounded_price)] = {"buy_vol": 0, "sell_vol": 0}
+                                # 1. Get the current 5-minute time block
+                                candle_key = get_current_candle_time()
+                                
+                                # 2. If it's a new 5-minute candle, create it!
+                                if candle_key not in footprint_candles:
+                                    footprint_candles[candle_key] = {}
                                     
+                                    # Optional: Prevent memory crashes by keeping only the last 12 candles (1 hour)
+                                    if len(footprint_candles) > 12:
+                                        oldest_candle = list(footprint_candles.keys())[0]
+                                        del footprint_candles[oldest_candle]
+
+                                current_matrix = footprint_candles[candle_key]
+                                
+                                if str(rounded_price) not in current_matrix:
+                                    current_matrix[str(rounded_price)] = {"buy_vol": 0, "sell_vol": 0}
+                                    
+                                # 3. Add the volume to the CURRENT 5-minute candle
                                 if ltp >= top_ask:
-                                    live_footprint_data[str(rounded_price)]["buy_vol"] += volume
+                                    current_matrix[str(rounded_price)]["buy_vol"] += volume
                                 elif ltp <= top_bid:
-                                    live_footprint_data[str(rounded_price)]["sell_vol"] += volume
+                                    current_matrix[str(rounded_price)]["sell_vol"] += volume
                                     
             except Exception as e:
-                pass # Ignore malformed ticks to keep stream alive
+                pass 
 
         streamer.on("message", on_message)
-        
-        print("⚡ Footprint V3 Streamer Connecting...")
+        print(f"⚡ Footprint Streamer Connecting ({TIMEFRAME_MINUTES}-Min Candles)...")
         streamer.connect()
         
     except Exception as e:
         print("Footprint Streamer Crash:", e)
+
+@app.route("/api/footprint", methods=['GET', 'OPTIONS'])
+@require_firebase_auth
+def get_footprint():
+    if request.method == 'OPTIONS': 
+        return jsonify({"status": "ok"}), 200
+    
+    return jsonify({
+        "status": "success",
+        "instrument": "NIFTY",
+        "data": footprint_candles # We now send ALL candles to the frontend!
+    })
+
+import threading
+threading.Thread(target=start_footprint_streamer, daemon=True).start()
 
 @app.route("/user-profile", methods=['GET', 'OPTIONS'])
 @require_firebase_auth
