@@ -35,8 +35,13 @@ import asyncio
 live_footprint_data = {}
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
-
+# SECURITY FIX: Only allow your official frontend domain to access the API
+ALLOWED_ORIGINS = [
+    "https://imsaurav1112-design.github.io",  # Your Production Frontend
+    "http://127.0.0.1:5500",                  # Local VS Code Live Server
+    "http://localhost:3000"
+]
+CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
 # ══════════════════════════════════════════════════════════
 #  🔑 CONFIGURATION & CLOUD SETUP
 # ══════════════════════════════════════════════════════════
@@ -694,20 +699,6 @@ def save_token(token):
         return True
     except: return False
 
-@app.route("/login")
-def login_route():
-    params = {"response_type": "code", "client_id": API_KEY, "redirect_uri": REDIRECT_URI}
-    login_url = f"https://api.upstox.com/v2/login/authorization/dialog?{urlencode(params)}"
-    return f'<a href="{login_url}">Click here to Login</a>'
-
-@app.route("/callback")
-def callback_route():
-    code = request.args.get("code")
-    resp = requests.post("https://api.upstox.com/v2/login/authorization/token", data={"code": code, "client_id": API_KEY, "client_secret": API_SECRET, "redirect_uri": REDIRECT_URI, "grant_type": "authorization_code"}, headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"})
-    if resp.status_code == 200:
-        save_token(resp.json().get("access_token"))
-        return '✅ Login Successful!'
-    return f'❌ Failed: {resp.text}'
 
 from datetime import timedelta
 
@@ -718,61 +709,64 @@ def pay_with_wallet():
         return jsonify({"status": "ok"}), 200
         
     try:
-        uid = request.user.get('uid')
+        # SECURITY FIX 1: Prevent NoSQL Injection
+        uid = str(request.user.get('uid'))
         data = request.json
         plan_id = data.get("plan")
         cost = float(data.get("cost", 0))
         
-        # 1. Validate the plan costs strictly on the backend so hackers can't send fake prices
+        # 1. Validate the plan costs strictly on the backend
         plan_prices = {"1_month": 249, "3_months": 599, "6_months": 999}
         plan_days = {"1_month": 30, "3_months": 90, "6_months": 180}
         
         if plan_id not in plan_prices or cost != plan_prices[plan_id]:
             return jsonify({"error": "Invalid plan or price manipulation detected."}), 400
             
+        # 2. Fetch user to check current tier/expiry for date math
         user_doc = users_col.find_one({"_id": uid})
         if not user_doc: 
             return jsonify({"error": "User not found in database."}), 404
         
-        current_balance = float(user_doc.get("wallet_balance", 0))
-        
-        # 2. Check if they actually have enough money
-        if current_balance < cost:
-            return jsonify({"error": "Insufficient wallet balance."}), 400
-            
-        # 3. Deduct the cost
-        new_balance = current_balance - cost
-        
-        # 4. Calculate the new Expiry Date safely
+        # 3. Calculate the new Expiry Date safely BEFORE deducting
         now = get_ist_now()
         current_expiry = user_doc.get("expiry")
         
-        # If they are already Pro, extend their current expiry date. Otherwise, start from today.
         if user_doc.get("tier") == "pro" and current_expiry and current_expiry > now:
             new_expiry = current_expiry + timedelta(days=plan_days[plan_id])
         else:
             new_expiry = now + timedelta(days=plan_days[plan_id])
             
-        # 5. Save the updated Wallet Balance, Tier, and Expiry directly to MongoDB
-        users_col.update_one(
-            {"_id": uid},
-            {"$set": {
-                "wallet_balance": new_balance,
-                "tier": "pro",
-                "expiry": new_expiry
-            }}
+        # 4. 🛡️ ATOMIC UPDATE (Fixes the Race Condition / Double-Spend)
+        # This tells MongoDB: "ONLY update if they have enough money. If they do, 
+        # deduct the money, set them to Pro, and set their new expiry ALL AT ONCE."
+        result = users_col.update_one(
+            {"_id": uid, "wallet_balance": {"$gte": cost}},
+            {
+                "$inc": {"wallet_balance": -cost},
+                "$set": {
+                    "tier": "pro",
+                    "expiry": new_expiry
+                }
+            }
         )
+        
+        # 5. Check if the Atomic Update succeeded
+        # If modified_count is 0, they didn't have enough money (or pressed the button twice)
+        if result.modified_count == 0:
+            return jsonify({"error": "Insufficient wallet balance or concurrent transaction blocked."}), 400
+            
+        # 6. Calculate estimated new balance to send to frontend UI
+        estimated_new_balance = float(user_doc.get("wallet_balance", 0)) - cost
         
         return jsonify({
             "status": "success", 
-            "new_balance": new_balance, 
+            "new_balance": estimated_new_balance, 
             "new_expiry": new_expiry.strftime("%Y-%m-%d")
         }), 200
         
     except Exception as e:
         print("Wallet Payment Error:", e)
         return jsonify({"error": str(e)}), 500
-
 # ══════════════════════════════════════════════════════════
 #  🟢 RAZORPAY PAYMENT ROUTES
 # ══════════════════════════════════════════════════════════
@@ -825,7 +819,7 @@ def verify_payment():
         return jsonify({"status": "ok"}), 200
         
     try:
-        uid = request.user.get('uid')
+        uid = str(request.user.get('uid'))
         data = request.json
         
         # 1. Extract Razorpay signature details
