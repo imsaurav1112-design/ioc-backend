@@ -30,11 +30,11 @@ from firebase_admin import credentials, auth
 import razorpay
 import threading
 import asyncio
-from upstox_client.websocket.market_data im
-port MarketDataStreamer
+from upstox_client.websocket.market_data import MarketDataStreamer
 
 # Global dictionary to store our live Footprint matrix
 live_footprint_data = {}
+
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
