@@ -964,22 +964,56 @@ def start_footprint_streamer():
     except Exception as e:
         print("Footprint Streamer Crash:", e)
 
+import time
+import random
+from datetime import datetime
+
+# Temporary Simulator Memory
+simulated_candles = {}
+
+def get_current_candle_time():
+    now = datetime.now()
+    minute = (now.minute // 5) * 5
+    candle_time = now.replace(minute=minute, second=0, microsecond=0)
+    return candle_time.strftime("%H:%M")
+
 @app.route("/api/footprint", methods=['GET', 'OPTIONS'])
 def get_footprint():
-    # 1. Let the browser's CORS preflight check pass through safely!
     if request.method == 'OPTIONS': 
         return jsonify({"status": "ok"}), 200
     
-    # 2. Basic security check to ensure they are logged in on the frontend
-    auth_header = request.headers.get('Authorization')
-    if not auth_header or not auth_header.startswith("Bearer "):
-        return jsonify({"error": "Unauthorized Access"}), 401
+    # --- WEEKEND SIMULATOR INJECTION ---
+    global simulated_candles
     
-    # 3. Send the time-based candles back to the frontend
+    # 1. Get current 5-min block
+    candle_key = get_current_candle_time()
+    
+    # 2. Start a new candle if needed
+    if candle_key not in simulated_candles:
+        simulated_candles[candle_key] = {}
+        # Pre-fill with a base price to simulate an orderbook
+        for i in range(-5, 6):
+            price = str(22500 + (i * 5))
+            simulated_candles[candle_key][price] = {"buy_vol": 0, "sell_vol": 0}
+
+    # 3. Simulate a random massive trade every time the frontend asks for data (every 2 seconds)
+    random_strike = str(22500 + (random.randint(-2, 2) * 5))
+    vol = random.randint(10, 150)
+    
+    # Create a giant imbalance 20% of the time
+    if random.random() > 0.8:
+        vol = random.randint(400, 1000)
+        
+    if random.random() > 0.5:
+        simulated_candles[candle_key][random_strike]["buy_vol"] += vol
+    else:
+        simulated_candles[candle_key][random_strike]["sell_vol"] += vol
+    # -----------------------------------
+
     return jsonify({
         "status": "success",
         "instrument": "NIFTY",
-        "data": footprint_candles 
+        "data": simulated_candles 
     })
 
 # ══════════════════════════════════════════════════════════
