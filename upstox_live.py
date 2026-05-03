@@ -1008,6 +1008,9 @@ def get_current_candle_time():
     candle_time = now.replace(minute=minute, second=0, microsecond=0)
     return candle_time.strftime("%H:%M")
 
+# Holds the live crawler prices for the 50 stocks
+live_ticker_prices = {}
+
 def start_footprint_streamer():
     global footprint_candles
     
@@ -1016,7 +1019,7 @@ def start_footprint_streamer():
         print("🚨 ERROR: No Analytics Token found! Footprint engine cannot start.")
         return
 
-try:
+    try:
         configuration = upstox_client.Configuration()
         configuration.access_token = ANALYTICS_TOKEN
         api_client = upstox_client.ApiClient(configuration)
@@ -1034,8 +1037,7 @@ try:
         ]
 
         streamer = upstox_client.MarketDataStreamerV3(api_client, nifty_keys, "full")
-
-        def on_message(message):
+       def on_message(message):
             global live_ticker_prices
             try:
                 if "feeds" in message:
@@ -1046,7 +1048,6 @@ try:
                             if "marketFF" in feed["ff"]:
                                 market_data = feed["ff"]["marketFF"]
                                 ltp = float(market_data["ltpc"]["ltp"])
-                                # Save the stock price to memory for the frontend to fetch
                                 live_ticker_prices[incoming_key] = ltp
                                 
                             # 2. PROCESS NIFTY INDEX (For the Footprint Chart)
@@ -1114,7 +1115,6 @@ def get_ticker_tape():
     if request.method == 'OPTIONS': 
         return jsonify({"status": "ok"}), 200
     
-    # Send the live stock prices to the frontend crawler
     return jsonify({
         "status": "success",
         "data": live_ticker_prices
