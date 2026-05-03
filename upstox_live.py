@@ -1037,7 +1037,8 @@ def start_footprint_streamer():
         ]
 
         streamer = upstox_client.MarketDataStreamerV3(api_client, nifty_keys, "full")
-       def on_message(message):
+
+        def on_message(message):
             global live_ticker_prices
             try:
                 if "feeds" in message:
@@ -1096,7 +1097,6 @@ def start_footprint_streamer():
 
 # Automatically boot the real engine in the background when the server starts
 threading.Thread(target=start_footprint_streamer, daemon=True).start()
-
 
 @app.route("/api/footprint", methods=['GET', 'OPTIONS'])
 def get_footprint():
