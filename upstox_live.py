@@ -76,6 +76,8 @@ def get_ist_now():
     """Returns a timezone-aware datetime object for precise Indian Standard Time."""
     return datetime.now(IST)
 
+BASE_URL = "https://api.upstox.com/v2"
+
 SYMBOL_MAP = {
     "NIFTY":      {"instrument_key": "NSE_INDEX|Nifty 50",            "lot": 75,  "step": 50},
     "BANKNIFTY":  {"instrument_key": "NSE_INDEX|Nifty Bank",          "lot": 15,  "step": 100}, 
