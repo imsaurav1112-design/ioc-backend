@@ -203,30 +203,37 @@ def fetch_custom_mcx_chain(base_name, expiry_str, headers):
 #  🟢 FIREBASE & MONGODB SETUP
 # ══════════════════════════════════════════════════════════
 import sys
-
-try:
-    cred = credentials.Certificate(os.path.join(os.getcwd(), 'firebase-admin.json'))
-    firebase_admin.initialize_app(cred)
-    print("🔥 Firebase Admin initialized successfully.")
-except Exception as e:
-    print(f"🚨 FATAL ERROR: Firebase initialization failed: {e}")
-    print("The server cannot run without Firebase. Shutting down...")
-    sys.exit(1)  # This tells Render to immediately crash the deployment and alert you
-
 from urllib.parse import quote_plus
+from pymongo import MongoClient
+
+# 1. DEFINE GLOBALS FIRST (This physically prevents the NameError)
+mongo_client = None
+db = None
+sys_col = None
+users_col = None
+history_col = None
+paper_trades_col = None
+
 MONGO_URI = os.environ.get("MONGO_URI")
+
+# 2. CONNECT TO DATABASE
 try:
     mongo_client = MongoClient(MONGO_URI)
     db = mongo_client["ioc_terminal"]
+    
     sys_col = db["system_config"]
     users_col = db["users"]
     history_col = db["history"]
-    
-    # 🟢 NEW: Added Collection for Paper Trades
     paper_trades_col = db["paper_trades"]
     
     history_col.create_index("createdAt", expireAfterSeconds=3456000)
-except Exception as e: pass
+    print("✅ MongoDB Connected & Collections Initialized")
+except Exception as e:
+    print(f"🚨 MongoDB Connection Failed: {e}")
+
+# ══════════════════════════════════════════════════════════
+#  🟢 Razorpay Keys
+# ══════════════════════════════════════════════════════════
 
 RZP_KEY_ID = os.environ.get("RZP_KEY_ID")
 RZP_KEY_SECRET = os.environ.get("RZP_KEY_SECRET")
