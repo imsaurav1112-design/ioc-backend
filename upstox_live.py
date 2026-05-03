@@ -1016,12 +1016,11 @@ def start_footprint_streamer():
         print("🚨 ERROR: No Analytics Token found! Footprint engine cannot start.")
         return
 
-    try:
+try:
         configuration = upstox_client.Configuration()
         configuration.access_token = ANALYTICS_TOKEN
         api_client = upstox_client.ApiClient(configuration)
         
-try:
         # ==========================================
         # 🟢 LIVE TICKER TAPE SUBSCRIPTIONS
         # ==========================================
@@ -1035,59 +1034,58 @@ try:
         ]
 
         streamer = upstox_client.MarketDataStreamerV3(api_client, nifty_keys, "full")
-        # ==========================================
-
-    except Exception as e:
-        print(f"🚨 Streamer Initialization Error: {e}")
-
-         # ==========================================
 
         def on_message(message):
+            global live_ticker_prices
             try:
-                if "feeds" in message and instrument in message["feeds"]:
-                    feed = message["feeds"][instrument]
-                    
-                    if "ff" in feed and "marketFF" in feed["ff"]:
-                        market_data = feed["ff"]["marketFF"]
+                if "feeds" in message:
+                    for incoming_key, feed in message["feeds"].items():
                         
-                        ltp = float(market_data["ltpc"]["ltp"])
-                        volume = int(market_data["ltpc"].get("ltq", 0))
-                        
-                        if volume > 0 and "marketLevel" in market_data:
-                            bids_asks = market_data["marketLevel"].get("bidAskQuote", [])
-                            if len(bids_asks) > 0:
-                                top_bid = float(bids_asks[0]["bp"])
-                                top_ask = float(bids_asks[0]["ap"])
-                                rounded_price = round(ltp)
+                        if "ff" in feed:
+                            # 1. PROCESS EQUITIES (For the Ticker Tape)
+                            if "marketFF" in feed["ff"]:
+                                market_data = feed["ff"]["marketFF"]
+                                ltp = float(market_data["ltpc"]["ltp"])
+                                # Save the stock price to memory for the frontend to fetch
+                                live_ticker_prices[incoming_key] = ltp
                                 
-                                # 1. Get current 5-minute block
-                                candle_key = get_current_candle_time()
+                            # 2. PROCESS NIFTY INDEX (For the Footprint Chart)
+                            elif "indexFF" in feed["ff"] and incoming_key == "NSE_INDEX|Nifty 50":
+                                index_data = feed["ff"]["indexFF"]
+                                ltp = float(index_data["ltpc"]["ltp"])
+                                volume = int(index_data["ltpc"].get("ltq", 0))
                                 
-                                # 2. Create new candle if needed
-                                if candle_key not in footprint_candles:
-                                    footprint_candles[candle_key] = {}
-                                    
-                                    # Memory Management: Keep only last 12 candles (1 hour)
-                                    if len(footprint_candles) > 12:
-                                        oldest_candle = sorted(list(footprint_candles.keys()))[0]
-                                        del footprint_candles[oldest_candle]
+                                # -- FOOTPRINT LOGIC FOR NIFTY ONLY --
+                                if volume > 0 and "marketLevel" in index_data:
+                                    bids_asks = index_data["marketLevel"].get("bidAskQuote", [])
+                                    if len(bids_asks) > 0:
+                                        top_bid = float(bids_asks[0]["bp"])
+                                        top_ask = float(bids_asks[0]["ap"])
+                                        rounded_price = round(ltp)
+                                        
+                                        candle_key = get_current_candle_time()
+                                        
+                                        if candle_key not in footprint_candles:
+                                            footprint_candles[candle_key] = {}
+                                            if len(footprint_candles) > 12:
+                                                oldest_candle = sorted(list(footprint_candles.keys()))[0]
+                                                del footprint_candles[oldest_candle]
 
-                                current_matrix = footprint_candles[candle_key]
-                                
-                                if str(rounded_price) not in current_matrix:
-                                    current_matrix[str(rounded_price)] = {"buy_vol": 0, "sell_vol": 0}
-                                    
-                                # 3. Classify and add volume
-                                if ltp >= top_ask:
-                                    current_matrix[str(rounded_price)]["buy_vol"] += volume
-                                elif ltp <= top_bid:
-                                    current_matrix[str(rounded_price)]["sell_vol"] += volume
-                                    
+                                        current_matrix = footprint_candles[candle_key]
+                                        
+                                        if str(rounded_price) not in current_matrix:
+                                            current_matrix[str(rounded_price)] = {"buy_vol": 0, "sell_vol": 0}
+                                            
+                                        if ltp >= top_ask:
+                                            current_matrix[str(rounded_price)]["buy_vol"] += volume
+                                        elif ltp <= top_bid:
+                                            current_matrix[str(rounded_price)]["sell_vol"] += volume
+                                            
             except Exception as e:
                 pass 
 
         streamer.on("message", on_message)
-        print(f"⚡ REAL Footprint Streamer Connecting ({TIMEFRAME_MINUTES}-Min Candles)...")
+        print(f"⚡ REAL Footprint & Ticker Streamer Connecting...")
         streamer.connect()
         
     except Exception as e:
@@ -1110,6 +1108,18 @@ def get_footprint():
         "instrument": "NIFTY",
         "data": footprint_candles 
     })
+
+@app.route("/api/ticker-tape", methods=['GET', 'OPTIONS'])
+def get_ticker_tape():
+    if request.method == 'OPTIONS': 
+        return jsonify({"status": "ok"}), 200
+    
+    # Send the live stock prices to the frontend crawler
+    return jsonify({
+        "status": "success",
+        "data": live_ticker_prices
+    })
+    
 # ══════════════════════════════════════════════════════════
 #  🟢 USER PROFILE ROUTE
 # ══════════════════════════════════════════════════════════
