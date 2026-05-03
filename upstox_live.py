@@ -203,10 +203,12 @@ def fetch_custom_mcx_chain(base_name, expiry_str, headers):
 #  🟢 FIREBASE & MONGODB SETUP
 # ══════════════════════════════════════════════════════════
 import sys
-from urllib.parse import quote_plus
+import os
+import firebase_admin
+from firebase_admin import credentials, auth
 from pymongo import MongoClient
 
-# 1. DEFINE GLOBALS FIRST (This physically prevents the NameError)
+# 1. DEFINE GLOBALS FIRST (Prevents 500 NameErrors)
 mongo_client = None
 db = None
 sys_col = None
@@ -214,9 +216,19 @@ users_col = None
 history_col = None
 paper_trades_col = None
 
-MONGO_URI = os.environ.get("MONGO_URI")
+# 2. INITIALIZE FIREBASE (Prevents 401 Unauthorized Errors)
+try:
+    # Check if already initialized to prevent crash on server reload
+    if not firebase_admin._apps:
+        cred = credentials.Certificate(os.path.join(os.getcwd(), 'firebase-admin.json'))
+        firebase_admin.initialize_app(cred)
+        print("🔥 Firebase Admin initialized successfully.")
+except Exception as e:
+    print(f"🚨 FATAL ERROR: Firebase initialization failed: {e}")
+    sys.exit(1)
 
-# 2. CONNECT TO DATABASE
+# 3. CONNECT TO MONGODB
+MONGO_URI = os.environ.get("MONGO_URI")
 try:
     mongo_client = MongoClient(MONGO_URI)
     db = mongo_client["ioc_terminal"]
@@ -230,7 +242,6 @@ try:
     print("✅ MongoDB Connected & Collections Initialized")
 except Exception as e:
     print(f"🚨 MongoDB Connection Failed: {e}")
-
 # ══════════════════════════════════════════════════════════
 #  🟢 Razorpay Keys
 # ══════════════════════════════════════════════════════════
