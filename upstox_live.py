@@ -1026,16 +1026,17 @@ try:
         # 🟢 LIVE TICKER TAPE SUBSCRIPTIONS
         # ==========================================
         nifty_keys = [
-            "NSE_INDEX|Nifty 50",       # Main Nifty 50 Index 
-            "NSE_EQ|INE002A01018",      # Reliance
-            "NSE_EQ|INE040A01034",      # HDFC Bank
-            "NSE_EQ|INE467B01029",      # TCS
-            "NSE_EQ|INE090A01021",      # ICICI Bank
-            "NSE_EQ|INE009A01021"       # Infosys
+            "NSE_INDEX|Nifty 50",       
+            "NSE_EQ|INE002A01018",      
+            "NSE_EQ|INE040A01034",      
+            "NSE_EQ|INE467B01029",      
+            "NSE_EQ|INE090A01021",      
+            "NSE_EQ|INE009A01021"       
         ]
 
         streamer = upstox_client.MarketDataStreamerV3(api_client, nifty_keys, "full")
-        
+        # ==========================================
+
     except Exception as e:
         print(f"🚨 Streamer Initialization Error: {e}")
 
