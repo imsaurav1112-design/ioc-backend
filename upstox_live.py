@@ -1021,22 +1021,25 @@ def start_footprint_streamer():
         configuration.access_token = ANALYTICS_TOKEN
         api_client = upstox_client.ApiClient(configuration)
         
-       # ==========================================
-# 🟢 LIVE TICKER TAPE SUBSCRIPTIONS
-# ==========================================
-# We subscribe to the main index + the Top 5 heavyweights to feed the crawler
-nifty_keys = [
-    "NSE_INDEX|Nifty 50",       # Main Nifty 50 Index (Required for Option Chain)
-    "NSE_EQ|INE002A01018",      # Reliance
-    "NSE_EQ|INE040A01034",      # HDFC Bank
-    "NSE_EQ|INE467B01029",      # TCS
-    "NSE_EQ|INE090A01021",      # ICICI Bank
-    "NSE_EQ|INE009A01021"       # Infosys
-    # You can add the other 45 ISINs here later!
-]
+try:
+        # ==========================================
+        # 🟢 LIVE TICKER TAPE SUBSCRIPTIONS
+        # ==========================================
+        nifty_keys = [
+            "NSE_INDEX|Nifty 50",       # Main Nifty 50 Index 
+            "NSE_EQ|INE002A01018",      # Reliance
+            "NSE_EQ|INE040A01034",      # HDFC Bank
+            "NSE_EQ|INE467B01029",      # TCS
+            "NSE_EQ|INE090A01021",      # ICICI Bank
+            "NSE_EQ|INE009A01021"       # Infosys
+        ]
 
-streamer = upstox_client.MarketDataStreamerV3(api_client, nifty_keys, "full")
-# ==========================================
+        streamer = upstox_client.MarketDataStreamerV3(api_client, nifty_keys, "full")
+        
+    except Exception as e:
+        print(f"🚨 Streamer Initialization Error: {e}")
+
+         # ==========================================
 
         def on_message(message):
             try:
