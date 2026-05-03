@@ -1057,7 +1057,7 @@ def start_footprint_streamer():
                                 ltp = float(index_data["ltpc"]["ltp"])
                                 volume = int(index_data["ltpc"].get("ltq", 0))
                                 
-                                # -- FOOTPRINT LOGIC FOR NIFTY ONLY --
+                               # -- FOOTPRINT LOGIC FOR NIFTY ONLY --
                                 if volume > 0 and "marketLevel" in index_data:
                                     bids_asks = index_data["marketLevel"].get("bidAskQuote", [])
                                     if len(bids_asks) > 0:
@@ -1067,13 +1067,23 @@ def start_footprint_streamer():
                                         
                                         candle_key = get_current_candle_time()
                                         
+                                        # 🟢 NEW: Initialize OHLC and volumes structure
                                         if candle_key not in footprint_candles:
-                                            footprint_candles[candle_key] = {}
+                                            footprint_candles[candle_key] = {
+                                                "open": ltp, "high": ltp, "low": ltp, "close": ltp,
+                                                "volumes": {}
+                                            }
                                             if len(footprint_candles) > 12:
                                                 oldest_candle = sorted(list(footprint_candles.keys()))[0]
                                                 del footprint_candles[oldest_candle]
 
-                                        current_matrix = footprint_candles[candle_key]
+                                        # 🟢 NEW: Update High, Low, and Close on every tick
+                                        footprint_candles[candle_key]["high"] = max(footprint_candles[candle_key]["high"], ltp)
+                                        footprint_candles[candle_key]["low"] = min(footprint_candles[candle_key]["low"], ltp)
+                                        footprint_candles[candle_key]["close"] = ltp
+
+                                        # Update Volume Matrix
+                                        current_matrix = footprint_candles[candle_key]["volumes"]
                                         
                                         if str(rounded_price) not in current_matrix:
                                             current_matrix[str(rounded_price)] = {"buy_vol": 0, "sell_vol": 0}
@@ -1081,8 +1091,7 @@ def start_footprint_streamer():
                                         if ltp >= top_ask:
                                             current_matrix[str(rounded_price)]["buy_vol"] += volume
                                         elif ltp <= top_bid:
-                                            current_matrix[str(rounded_price)]["sell_vol"] += volume
-                                            
+                                            current_matrix[str(rounded_price)]["sell_vol"] += volume                                            
             except Exception as e:
                 pass 
 
