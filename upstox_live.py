@@ -762,7 +762,7 @@ def email_daily_trades():
         
         return jsonify({"status": "success", "message": f"Emailed {len(users)} users and safely archived {len(trade_ids_processed)} trades."})
         
-except Exception as e:
+    except Exception as e:
         print("Email Cron Error:", e)
         return jsonify({"error": str(e)}), 500
 
@@ -863,7 +863,6 @@ def fetch_and_record(symbol):
         compress_and_save(symbol, exp, spot, pcr, chain_rows)
         
     except Exception as e: print(f"Record Error {symbol}: {e}")
-
 # 🟢 1. TARGET INDICES ONLY
 TARGET_INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"]
 
