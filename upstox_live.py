@@ -916,6 +916,20 @@ def email_daily_trades():
             with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
                 server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
                 server.send_message(msg)
+
+        # DATA FIX 2: Mark ONLY the processed trades as emailed. DO NOT DELETE.
+        if trade_ids_processed:
+            paper_trades_col.update_many(
+                {"_id": {"$in": trade_ids_processed}},
+                {"$set": {"emailed": True, "emailed_at": datetime.utcnow()}}
+            )
+        
+        return jsonify({"status": "success", "message": f"Emailed {len(users)} users and safely archived {len(trade_ids_processed)} trades."})
+        
+    except Exception as e:
+        print("Email Cron Error:", e)
+        return jsonify({"error": str(e)}), 500
+
 # ══════════════════════════════════════════════════════════
 #  🟢 THE EXTERNAL CRON ENGINE (HISTORY RECORDING)
 # ══════════════════════════════════════════════════════════
