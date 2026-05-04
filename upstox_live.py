@@ -1078,11 +1078,42 @@ def start_footprint_streamer():
                                 ltp = float(market_data["ltpc"]["ltp"])
                                 live_ticker_prices[incoming_key] = ltp
                                 
-                            # 2. PROCESS NIFTY INDEX (For the Footprint Chart)
+                           # 2. PROCESS NIFTY INDEX (For the Footprint Chart)
                             elif "indexFF" in feed["ff"] and incoming_key == "NSE_INDEX|Nifty 50":
                                 index_data = feed["ff"]["indexFF"]
                                 ltp = float(index_data["ltpc"]["ltp"])
-                                volume = int(index_data["ltpc"].get("ltq", 0))
+                                
+                                # 🟢 FIX: Spot has no real volume/orderbook. We use Synthetic Momentum Volume.
+                                rounded_price = round(ltp)
+                                candle_key = get_current_candle_time()
+                                
+                                if candle_key not in footprint_candles:
+                                    footprint_candles[candle_key] = {
+                                        "open": ltp, "high": ltp, "low": ltp, "close": ltp, "volumes": {}
+                                    }
+                                    if len(footprint_candles) > 12:
+                                        oldest_candle = sorted(list(footprint_candles.keys()))[0]
+                                        del footprint_candles[oldest_candle]
+
+                                # Update OHLC
+                                footprint_candles[candle_key]["high"] = max(footprint_candles[candle_key]["high"], ltp)
+                                footprint_candles[candle_key]["low"] = min(footprint_candles[candle_key]["low"], ltp)
+                                footprint_candles[candle_key]["close"] = ltp
+
+                                # Initialize Volume Row
+                                current_matrix = footprint_candles[candle_key]["volumes"]
+                                if str(rounded_price) not in current_matrix:
+                                    current_matrix[str(rounded_price)] = {"buy_vol": 0, "sell_vol": 0}
+
+                                # Synthetic Orderflow Logic (Calculates Buy/Sell pressure based on tick direction)
+                                prev_close = index_data["ltpc"].get("cp", ltp) # Fallback to ltp if cp missing
+                                tick_diff = ltp - prev_close
+                                synthetic_vol = int(abs(tick_diff) * 150) + 25 # Generates 25 to ~300 volume per tick
+                                
+                                if tick_diff >= 0:
+                                    current_matrix[str(rounded_price)]["buy_vol"] += synthetic_vol
+                                else:
+                                    current_matrix[str(rounded_price)]["sell_vol"] += synthetic_vol
                                 
                                # -- FOOTPRINT LOGIC FOR NIFTY ONLY --
                                 if volume > 0 and "marketLevel" in index_data:
