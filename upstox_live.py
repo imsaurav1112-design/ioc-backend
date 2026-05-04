@@ -1154,11 +1154,22 @@ def start_footprint_streamer():
                     for incoming_key, feed in message["feeds"].items():
                         
                         if "ff" in feed:
-                            # 1. PROCESS EQUITIES (For the Ticker Tape)
+                           # 1. PROCESS EQUITIES (For the Ticker Tape)
                             if "marketFF" in feed["ff"]:
                                 market_data = feed["ff"]["marketFF"]
-                                ltp = float(market_data["ltpc"]["ltp"])
-                                live_ticker_prices[incoming_key] = ltp
+                                ltpc = market_data.get("ltpc", {})
+                                
+                                ltp = float(ltpc.get("ltp", 0))
+                                cp = float(ltpc.get("cp", ltp)) # Grab previous close (fallback to ltp)
+                                
+                                # Calculate the percentage change instantly
+                                pct_change = round(((ltp - cp) / cp) * 100, 2) if cp > 0 else 0.0
+                                
+                                # Store as an object instead of just a flat number
+                                live_ticker_prices[incoming_key] = {
+                                    "ltp": ltp,
+                                    "pct": pct_change
+                                }
                                 
                            # 2. PROCESS NIFTY INDEX (For the Footprint Chart)
                             elif "indexFF" in feed["ff"] and incoming_key == "NSE_INDEX|Nifty 50":
