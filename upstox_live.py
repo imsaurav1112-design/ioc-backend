@@ -467,19 +467,30 @@ def health():
     is_auth = ANALYTICS_TOKEN is not None
     return jsonify({"status": "ok", "authenticated": is_auth})
 
-@app.route("/expiry-dates", methods=['GET', 'OPTIONS'], strict_slashes=False)
+@app.route("/api/available-dates", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
-def expiry_dates():
+def available_dates():
+    # Handle the CORS preflight check
+    if request.method == 'OPTIONS': 
+        return jsonify({"status": "ok"}), 200
+        
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
-    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400 
-    cfg = SYMBOL_MAP.get(symbol)
+    expiry = request.args.get("expiry", "").strip()
     
-    is_backtest = request.headers.get("Referer", "").endswith("backtester.html")
-    if is_backtest:
-        try:
-            saved_expiries = history_col.distinct("exp", {"sym": symbol})
-            return jsonify({"symbol": symbol, "expiries": sorted(saved_expiries)})
-        except Exception as e: return jsonify({"error": str(e)}), 500
+    try:
+        # Search the MongoDB history collection for all distinct dates for this symbol/expiry combo
+        saved_dates = history_col.distinct("date", {"sym": symbol, "exp": expiry})
+        
+        # Sort them descending so the most recent dates show up first in your dropdown
+        saved_dates.sort(reverse=True)
+        
+        return jsonify({
+            "symbol": symbol, 
+            "expiry": expiry, 
+            "dates": saved_dates
+        })
+    except Exception as e: 
+        return jsonify({"error": str(e)}), 500
 
     if cfg.get("is_mcx"):
         ensure_mcx_master()
