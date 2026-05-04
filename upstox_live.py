@@ -479,6 +479,13 @@ def calculate_coa(chain_rows, symbol, expiry):
     # --- UTILITY FUNCTIONS ---
 
 def fetch_closed_market_ticker():
+    # Load the token directly from Render's environment variables
+    access_token = os.environ.get("UPSTOX_ANALYTICS_TOKEN")
+    
+    if not access_token:
+        print("ERROR: UPSTOX_ANALYTICS_TOKEN not found in Render environment!")
+        return {}
+
     # The exact instrument keys for your ticker
     instrument_keys = [
         "NSE_INDEX|Nifty 50",
@@ -492,10 +499,9 @@ def fetch_closed_market_ticker():
     encoded_keys = urllib.parse.quote(",".join(instrument_keys))
     url = f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={encoded_keys}"
     
-    # ⚠️ IMPORTANT: Change YOUR_UPSTOX_ACCESS_TOKEN to the actual variable storing your token!
     headers = {
         'Accept': 'application/json',
-        'Authorization': f'Bearer {YOUR_UPSTOX_ACCESS_TOKEN}' 
+        'Authorization': f'Bearer {access_token}' 
     }
     
     try:
@@ -503,6 +509,7 @@ def fetch_closed_market_ticker():
         data = response.json()
         
         if 'data' not in data:
+            print("API responded, but no 'data' payload found:", data)
             return {}
             
         ticker_data = {}
