@@ -481,18 +481,50 @@ def health():
     is_auth = ANALYTICS_TOKEN is not None
     return jsonify({"status": "ok", "authenticated": is_auth})
 
+# ==========================================
+# 🟢 1. EXPIRY DATES ROUTE (Restored!)
+# ==========================================
+@app.route("/expiry-dates", methods=['GET', 'OPTIONS'], strict_slashes=False)
+@require_firebase_auth
+def expiry_dates():
+    symbol = request.args.get("symbol", "NIFTY").upper().strip()
+    if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400 
+    cfg = SYMBOL_MAP.get(symbol)
+    
+    is_backtest = request.headers.get("Referer", "").endswith("backtester.html")
+    if is_backtest:
+        try:
+            saved_expiries = history_col.distinct("exp", {"sym": symbol})
+            return jsonify({"symbol": symbol, "expiries": sorted(saved_expiries)})
+        except Exception as e: return jsonify({"error": str(e)}), 500
+
+    if cfg.get("is_mcx"):
+        ensure_mcx_master()
+        base = cfg["base_name"]
+        valid_exps = []
+        for e, data in MCX_MASTER_DICT.get(base, {}).items():
+            if data['date'] >= get_ist_now().date():
+                valid_exps.append(e)
+        valid_exps.sort(key=lambda x: MCX_MASTER_DICT[base][x]['date'])
+        return jsonify({"symbol": symbol, "expiries": valid_exps})
+    else:
+        resp = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
+        data = resp.json().get("data") or []
+        expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
+        return jsonify({"symbol": symbol, "expiries": expiries})
+
+
+# ==========================================
+# 🟢 2. AVAILABLE DATES ROUTE (For Backtester)
+# ==========================================
 @app.route("/api/available-dates", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def available_dates():
-    # Handle the CORS preflight check
-    if request.method == 'OPTIONS': 
-        return jsonify({"status": "ok"}), 200
-        
     symbol = request.args.get("symbol", "NIFTY").upper().strip()
     expiry = request.args.get("expiry", "").strip()
     
     try:
-        # Search the MongoDB history collection for all distinct dates for this symbol/expiry combo
+        # Search the MongoDB history collection for all distinct dates for this combo
         saved_dates = history_col.distinct("date", {"sym": symbol, "exp": expiry})
         
         # Sort them descending so the most recent dates show up first in your dropdown
