@@ -5,6 +5,9 @@ Streamlined Core Indices Version.
 IST Timezone enforced.
 Includes Paper Trading Database & 3:30 PM Auto-Emailer.
 """
+
+import requests
+import urllib.parse
 from jsonschema import validate, ValidationError
 import heapq
 import concurrent.futures
@@ -472,6 +475,7 @@ def calculate_coa(chain_rows, symbol, expiry):
         "s1": s1_val, "r1": r1_val, "s2": s2_row['pe_prz'] if s2_row else s2_strike, "r2": r2_row['ce_prz'] if r2_row else r2_strike, 
         "logs": mem['logs']
     }
+    
     # --- UTILITY FUNCTIONS ---
 
 def fetch_closed_market_ticker():
@@ -514,7 +518,6 @@ def fetch_closed_market_ticker():
         return {}
 
 # -------------------------
-
 # ══════════════════════════════════════════════════════════
 #  🟢 TERMINAL DATA ROUTES
 # ══════════════════════════════════════════════════════════
