@@ -762,9 +762,10 @@ def email_daily_trades():
         
         return jsonify({"status": "success", "message": f"Emailed {len(users)} users and safely archived {len(trade_ids_processed)} trades."})
         
-    except Exception as e:
+except Exception as e:
         print("Email Cron Error:", e)
         return jsonify({"error": str(e)}), 500
+
 # ══════════════════════════════════════════════════════════
 #  🟢 THE EXTERNAL CRON ENGINE (HISTORY RECORDING)
 # ══════════════════════════════════════════════════════════
@@ -864,9 +865,6 @@ def fetch_and_record(symbol):
     except Exception as e: print(f"Record Error {symbol}: {e}")
 
 from datetime import timedelta
-
-# 🟢 1. TARGET INDICES ONLY
-TARGET_INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"]
 
 @app.route("/cron/record", methods=['GET'])
 def trigger_record():
