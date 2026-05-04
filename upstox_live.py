@@ -482,7 +482,7 @@ def health():
     return jsonify({"status": "ok", "authenticated": is_auth})
 
 # ==========================================
-# 🟢 1. EXPIRY DATES ROUTE (Restored!)
+# 🟢 1. EXPIRY DATES ROUTE (Fixed for Backtester)
 # ==========================================
 @app.route("/expiry-dates", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
@@ -491,9 +491,12 @@ def expiry_dates():
     if symbol not in SYMBOL_MAP: return jsonify({"error": "Invalid symbol"}), 400 
     cfg = SYMBOL_MAP.get(symbol)
     
-    is_backtest = request.headers.get("Referer", "").endswith("backtester.html")
+    # 🟢 FIX: Check the URL explicitly instead of relying entirely on the browser's Referer header
+    is_backtest = request.args.get("source") == "backtester" or request.headers.get("Referer", "").endswith("backtester.html")
+    
     if is_backtest:
         try:
+            # Fetches ONLY expiries that actually have data saved in your DB
             saved_expiries = history_col.distinct("exp", {"sym": symbol})
             return jsonify({"symbol": symbol, "expiries": sorted(saved_expiries)})
         except Exception as e: return jsonify({"error": str(e)}), 500
