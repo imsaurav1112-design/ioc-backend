@@ -731,40 +731,152 @@ def intraday_history():
     except Exception as e: return jsonify({"error": str(e)}), 500
 
 # ══════════════════════════════════════════════════════════
-#  🟢 NEW: PAPER TRADING ROUTES
+#  🟢 ADVANCED PAPER TRADING ENGINE
 # ══════════════════════════════════════════════════════════
-@app.route("/api/paper-trade", methods=['POST', 'OPTIONS'])
+import uuid
+
+@app.route("/api/paper-trade/positions", methods=['GET', 'OPTIONS'])
 @require_firebase_auth
-def save_paper_trade():
+def get_paper_positions():
+    """Fetches Open and Closed positions separately for the UI."""
     if request.method == 'OPTIONS': return jsonify({"status": "ok"}), 200
     try:
-        trade_data = request.json
-        trade_data["user_email"] = request.user.get('email', 'unknown_user')
-        trade_data["date"] = get_ist_now().strftime("%Y-%m-%d")
+        uid = request.user.get('uid')
+        # Exclude MongoDB's internal _id to prevent JSON serialization errors
+        trades = list(paper_trades_col.find({"uid": uid}, {"_id": 0})) 
         
-        paper_trades_col.insert_one(trade_data)
-        return jsonify({"status": "success"})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        open_positions = [t for t in trades if t.get("status") == "Open"]
+        closed_positions = [t for t in trades if t.get("status") == "Closed"]
         
-@app.route("/api/paper-trade/exit", methods=['POST', 'OPTIONS'])
-@require_firebase_auth
-def exit_paper_trade():
-    if request.method == 'OPTIONS': return jsonify({"status": "ok"}), 200
-    try:
-        data = request.json
-        trade_id = data.get("id")
-        exit_price = data.get("exit_price")
-        pnl = data.get("pnl")
-        
-        paper_trades_col.update_one(
-            {"id": trade_id, "user_email": request.user.get('email')},
-            {"$set": {"status": "Closed", "exit_price": exit_price, "final_pnl": pnl}}
-        )
-        return jsonify({"status": "success"})
+        return jsonify({"status": "success", "open": open_positions, "closed": closed_positions})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/paper-trade/place", methods=['POST', 'OPTIONS'])
+@require_firebase_auth
+def place_paper_trade():
+    """Places a trade (Market/Limit), calculates margin, and deducts from balance."""
+    if request.method == 'OPTIONS': return jsonify({"status": "ok"}), 200
+    try:
+        uid = request.user.get('uid')
+        email = request.user.get('email')
+        trade_data = request.json
+        
+        qty = int(trade_data.get("qty", 0))
+        entry_price = float(trade_data.get("entry", 0))
+        required_margin = qty * entry_price
+
+        # 1. Check user's current paper balance
+        user_doc = users_col.find_one({"_id": uid})
+        current_bal = float(user_doc.get("paper_balance", 500000.0)) if user_doc else 500000.0
+
+        if current_bal < required_margin:
+            return jsonify({"error": f"Insufficient Virtual Margin. You need ₹{required_margin:.2f}"}), 400
+
+        # 2. Deduct margin from user's account safely
+        users_col.update_one({"_id": uid}, {"$inc": {"paper_balance": -required_margin}}, upsert=True)
+
+        # 3. Assemble trade document
+        trade_data["uid"] = uid
+        trade_data["user_email"] = email
+        trade_data["date"] = get_ist_now().strftime("%Y-%m-%d")
+        trade_data["time"] = get_ist_now().strftime("%H:%M:%S")
+        trade_data["status"] = "Open"
+        trade_data["required_margin"] = required_margin
+        
+        # SL and Target can be empty strings or None from frontend
+        trade_data["sl"] = trade_data.get("sl", "") 
+        trade_data["target"] = trade_data.get("target", "")
+        
+        # Ensure it has a unique ID for modification tracking
+        trade_data["id"] = trade_data.get("id", str(uuid.uuid4()))
+
+        paper_trades_col.insert_one(trade_data)
+        
+        return jsonify({"status": "success", "new_balance": current_bal - required_margin})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/paper-trade/modify", methods=['POST', 'OPTIONS'])
+@require_firebase_auth
+def modify_paper_trade():
+    """Updates the SL or Target of an existing Open position."""
+    if request.method == 'OPTIONS': return jsonify({"status": "ok"}), 200
+    try:
+        uid = request.user.get('uid')
+        data = request.json
+        trade_id = data.get("id")
+        
+        new_sl = data.get("sl", "")
+        new_target = data.get("target", "")
+
+        result = paper_trades_col.update_one(
+            {"id": trade_id, "uid": uid, "status": "Open"},
+            {"$set": {"sl": new_sl, "target": new_target}}
+        )
+        
+        if result.modified_count == 0:
+            return jsonify({"error": "Trade not found or is already closed."}), 400
+            
+        return jsonify({"status": "success", "message": "Position modified successfully."})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/paper-trade/exit", methods=['POST', 'OPTIONS'])
+@require_firebase_auth
+def exit_paper_trade():
+    """Squares off a position, calculates PnL, and returns capital + PnL to balance."""
+    if request.method == 'OPTIONS': return jsonify({"status": "ok"}), 200
+    try:
+        uid = request.user.get('uid')
+        data = request.json
+        trade_id = data.get("id")
+        exit_price = float(data.get("exit_price", 0))
+
+        # 1. Find the exact open trade
+        trade = paper_trades_col.find_one({"id": trade_id, "uid": uid, "status": "Open"})
+        if not trade:
+            return jsonify({"error": "Trade not found or already closed"}), 404
+
+        qty = int(trade.get("qty", 0))
+        entry_price = float(trade.get("entry", 0))
+        
+        # 2. Calculate Math (Assuming Option Buying: Long CE / Long PE)
+        pnl = (exit_price - entry_price) * qty
+        
+        # The amount returning to the wallet is their original margin PLUS their profit (or MINUS their loss)
+        returned_capital = (entry_price * qty) + pnl 
+
+        # 3. Add funds back to the user's paper balance
+        users_col.update_one({"_id": uid}, {"$inc": {"paper_balance": returned_capital}})
+        
+        # 4. Mark the trade as Closed
+        paper_trades_col.update_one(
+            {"id": trade_id, "uid": uid},
+            {"$set": {
+                "status": "Closed", 
+                "exit_price": exit_price, 
+                "final_pnl": pnl, 
+                "exit_time": get_ist_now().strftime("%H:%M:%S")
+            }}
+        )
+        
+        return jsonify({"status": "success", "pnl": pnl, "returned_capital": returned_capital})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/paper-trade/reset-balance", methods=['POST', 'OPTIONS'])
+@require_firebase_auth
+def reset_paper_balance():
+    """The safety switch: Resets the virtual balance back to 500,000."""
+    if request.method == 'OPTIONS': return jsonify({"status": "ok"}), 200
+    try:
+        uid = request.user.get('uid')
+        users_col.update_one({"_id": uid}, {"$set": {"paper_balance": 500000.0}}, upsert=True)
+        return jsonify({"status": "success", "new_balance": 500000.0, "message": "Balance refreshed to ₹500,000"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+        
 @app.route("/cron/email-trades", methods=['GET'])
 def email_daily_trades():
     now = get_ist_now()
@@ -804,20 +916,6 @@ def email_daily_trades():
             with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
                 server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
                 server.send_message(msg)
-
-        # DATA FIX 2: Mark ONLY the processed trades as emailed. DO NOT DELETE.
-        if trade_ids_processed:
-            paper_trades_col.update_many(
-                {"_id": {"$in": trade_ids_processed}},
-                {"$set": {"emailed": True, "emailed_at": datetime.utcnow()}}
-            )
-        
-        return jsonify({"status": "success", "message": f"Emailed {len(users)} users and safely archived {len(trade_ids_processed)} trades."})
-        
-    except Exception as e:
-        print("Email Cron Error:", e)
-        return jsonify({"error": str(e)}), 500
-
 # ══════════════════════════════════════════════════════════
 #  🟢 THE EXTERNAL CRON ENGINE (HISTORY RECORDING)
 # ══════════════════════════════════════════════════════════
@@ -1371,11 +1469,17 @@ def user_profile():
         exp = user_doc.get("expiry")
         exp_str = exp.strftime("%Y-%m-%d") if hasattr(exp, 'strftime') else "N/A"
 
-        # Extremely safe balance parsing
+       # Extremely safe balance parsing
         try:
             bal = float(user_doc.get("wallet_balance", 0))
         except:
             bal = 0.0
+
+        # 🟢 NEW: Safely initialize and parse paper trading balance
+        try:
+            paper_bal = float(user_doc.get("paper_balance", 500000.0))
+        except:
+            paper_bal = 500000.0
 
         return jsonify({
             "email": user_doc.get("email", request.user.get("email", "")),
@@ -1383,6 +1487,7 @@ def user_profile():
             "plan": user_doc.get("tier", "free"),
             "name": user_doc.get("name", "User"),
             "wallet_balance": bal,
+            "paper_balance": paper_bal, # <-- Sent to frontend
             "expiry_date": exp_str,
             "expiry": exp_str
         }), 200
