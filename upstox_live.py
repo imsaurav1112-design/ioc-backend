@@ -472,6 +472,48 @@ def calculate_coa(chain_rows, symbol, expiry):
         "s1": s1_val, "r1": r1_val, "s2": s2_row['pe_prz'] if s2_row else s2_strike, "r2": r2_row['ce_prz'] if r2_row else r2_strike, 
         "logs": mem['logs']
     }
+    # --- UTILITY FUNCTIONS ---
+
+def fetch_closed_market_ticker():
+    # The exact instrument keys for your ticker
+    instrument_keys = [
+        "NSE_INDEX|Nifty 50",
+        "NSE_EQ|INE002A01018", # RELIANCE
+        "NSE_EQ|INE040A01034", # HDFCBANK
+        "NSE_EQ|INE467B01029", # TCS
+        "NSE_EQ|INE090A01021", # ICICIBANK
+        "NSE_EQ|INE009A01021"  # INFY
+    ]
+    
+    encoded_keys = urllib.parse.quote(",".join(instrument_keys))
+    url = f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={encoded_keys}"
+    
+    # ⚠️ IMPORTANT: Change YOUR_UPSTOX_ACCESS_TOKEN to the actual variable storing your token!
+    headers = {
+        'Accept': 'application/json',
+        'Authorization': f'Bearer {YOUR_UPSTOX_ACCESS_TOKEN}' 
+    }
+    
+    try:
+        response = requests.get(url, headers=headers)
+        data = response.json()
+        
+        if 'data' not in data:
+            return {}
+            
+        ticker_data = {}
+        for key, details in data['data'].items():
+            ticker_data[key] = {
+                "ltp": details.get('last_price', 0),
+                "pct": details.get('net_change', 0) 
+            }
+            
+        return ticker_data
+    except Exception as e:
+        print(f"Failed to fetch offline ticker: {e}")
+        return {}
+
+# -------------------------
 
 # ══════════════════════════════════════════════════════════
 #  🟢 TERMINAL DATA ROUTES
@@ -1275,7 +1317,6 @@ def get_ticker_prices():
     if request.method == 'OPTIONS': 
         return jsonify({"status": "ok"}), 200
     
-    # Map ugly Upstox keys to beautiful Frontend names
     key_map = {
         "NSE_INDEX|Nifty 50": "NIFTY 50",
         "NSE_EQ|INE002A01018": "RELIANCE",
@@ -1285,14 +1326,21 @@ def get_ticker_prices():
         "NSE_EQ|INE009A01021": "INFY"
     }
 
-    friendly_prices = {}
-    for raw_key, price in live_ticker_prices.items():
-        if raw_key in key_map:
-            friendly_prices[key_map[raw_key]] = price
-
-    # Return exactly what the Javascript expects
-    return jsonify(friendly_prices)
+    # 1. Check if we have LIVE data from the WebSocket
+    current_data = live_ticker_prices 
     
+    # 2. If the dictionary is empty (Market is closed / Script just restarted)
+    if not current_data:
+        print("Market closed. Fetching fallback data...")
+        current_data = fetch_closed_market_ticker()
+
+    # 3. Format and return to the frontend
+    friendly_prices = {}
+    for raw_key, data in current_data.items():
+        if raw_key in key_map:
+            friendly_prices[key_map[raw_key]] = data
+
+    return jsonify(friendly_prices)    
 # ══════════════════════════════════════════════════════════
 #  🟢 USER PROFILE ROUTE
 # ══════════════════════════════════════════════════════════
