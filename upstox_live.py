@@ -864,7 +864,8 @@ def fetch_and_record(symbol):
         
     except Exception as e: print(f"Record Error {symbol}: {e}")
 
-from datetime import timedelta
+# 🟢 1. TARGET INDICES ONLY
+TARGET_INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"]
 
 @app.route("/cron/record", methods=['GET'])
 def trigger_record():
