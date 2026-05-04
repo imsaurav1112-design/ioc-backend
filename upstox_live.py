@@ -866,32 +866,6 @@ def fetch_and_record(symbol):
 # 🟢 1. TARGET INDICES ONLY
 TARGET_INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"]
 
-@app.route("/cron/record", methods=['GET'])
-def trigger_record():
-    now = get_ist_now()
-    if not ANALYTICS_TOKEN:
-        return jsonify({"status": "blocked", "reason": "no_analytics_token"}), 403
-    
-    is_weekday = now.weekday() < 5
-    is_market_open = (
-        (now.hour == 9 and now.minute >= 15) or 
-        (now.hour > 9 and now.hour < 15) or 
-        (now.hour == 15 and now.minute <= 30)
-    )
-
-    if is_weekday and is_market_open:
-        try:
-            # 🟢 FIX: Only record NIFTY, BANKNIFTY, and SENSEX
-            for sym in TARGET_INDICES:
-                fetch_and_record(sym)
-            return jsonify({"status": "success", "message": f"Recorded selected indices at {now.strftime('%H:%M:%S')} IST"})
-        except Exception as e:
-            return jsonify({"status": "error", "message": str(e)}), 500
-    
-    return jsonify({"status": "sleeping", "message": f"Market Closed"}), 200
-
-from datetime import timedelta
-
 @app.route("/pay-with-wallet", methods=['POST', 'OPTIONS'])
 @limiter.limit("5 per minute") 
 @require_firebase_auth
