@@ -561,13 +561,22 @@ def options_chain():
     # 🟢 1. CALCULATE MAX PAIN
     mp_val = calculate_max_pain(chain_rows)
 
-    # 🟢 2. FETCH INDIA VIX
+   # 🟢 2. FETCH INDIA VIX (Robust Version)
     vix_val = 0.0
     try:
-        vix_resp = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": "NSE_INDEX|India VIX"}, headers=auth_headers())
+        vix_key = "NSE_INDEX|India VIX"
+        vix_resp = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": vix_key}, headers=auth_headers())
+        
         if vix_resp.status_code == 200:
-            vix_val = vix_resp.json().get("data", {}).get("NSE_INDEX|India VIX", {}).get("last_price", 0.0)
-    except: pass
+            vix_data = vix_resp.json().get("data", {})
+            if vix_key in vix_data:
+                vix_val = vix_data[vix_key].get("last_price", 0.0)
+            else:
+                print(f"⚠️ VIX API Warning: Key not found. Upstox returned: {vix_data}")
+        else:
+            print(f"⚠️ VIX API Error: {vix_resp.status_code} - {vix_resp.text}")
+    except Exception as e: 
+        print(f"⚠️ VIX Code Crash: {e}")
 
     # 🟢 3. RETURN WITH NEW DATA
     return jsonify({
