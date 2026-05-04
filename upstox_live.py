@@ -795,7 +795,7 @@ def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
         )
         print(f"💾 SAVED TO MONGO: {symbol} at {time_key}")
     except Exception as e:
-        print(f"❌ MongoDB Record Error: {e}")
+        print(f"🚨 MongoDB Record Error: {e}")
 
 # 🟢 1. TARGET INDICES ONLY
 TARGET_INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"]
@@ -804,6 +804,7 @@ TARGET_INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"]
 def trigger_record():
     now = get_ist_now()
     if not ANALYTICS_TOKEN:
+        print("🚨 CRON FAILED: No Analytics Token found!")
         return jsonify({"status": "blocked", "reason": "no_analytics_token"}), 403
     
     is_weekday = now.weekday() < 5
@@ -813,16 +814,23 @@ def trigger_record():
         (now.hour == 15 and now.minute <= 30)
     )
 
-    if is_weekday and is_market_open:
+    # 🛠️ SECRET BYPASS: Add ?force=true to the URL to test it at night!
+    force = request.args.get("force") == "true"
+
+    if (is_weekday and is_market_open) or force:
         try:
-            # 🟢 FIX: Only record NIFTY, BANKNIFTY, and SENSEX
+            print(f"🔥 CRON TRIGGERED: Fetching live data for {TARGET_INDICES}...")
             for sym in TARGET_INDICES:
                 fetch_and_record(sym)
-            return jsonify({"status": "success", "message": f"Recorded selected indices at {now.strftime('%H:%M:%S')} IST"})
+            
+            print("✅ CRON COMPLETE: All indices successfully recorded.")
+            return jsonify({"status": "success", "message": f"🔥 Recorded selected indices at {now.strftime('%H:%M:%S')} IST"})
         except Exception as e:
+            print(f"❌ CRON ERROR: {str(e)}")
             return jsonify({"status": "error", "message": str(e)}), 500
     
-    return jsonify({"status": "sleeping", "message": f"Market Closed"}), 200
+    print(f"😴 CRON SLEEPING: Market is closed ({now.strftime('%I:%M %p')})")
+    return jsonify({"status": "sleeping", "message": f"😴 Market Closed"}), 200
 
 def fetch_and_record(symbol):
     cfg = SYMBOL_MAP.get(symbol)
@@ -862,7 +870,8 @@ def fetch_and_record(symbol):
         chain_rows = inject_prz(rows, exp, cfg["step"], spot)
         compress_and_save(symbol, exp, spot, pcr, chain_rows)
         
-    except Exception as e: print(f"Record Error {symbol}: {e}")
+    except Exception as e: print(f"⚠️ FETCH WARNING for {symbol}: {e}")
+        
 # 🟢 1. TARGET INDICES ONLY
 TARGET_INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"]
 
