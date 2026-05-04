@@ -561,22 +561,25 @@ def options_chain():
     # 🟢 1. CALCULATE MAX PAIN
     mp_val = calculate_max_pain(chain_rows)
 
-   # 🟢 2. FETCH INDIA VIX (Robust Version)
+# 🟢 2. FETCH INDIA VIX
     vix_val = 0.0
     try:
-        vix_key = "NSE_INDEX|India VIX"
-        vix_resp = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": vix_key}, headers=auth_headers())
+        # We ask for it using the Pipe (|)
+        request_key = "NSE_INDEX|India VIX"
+        # Upstox sends it back using the Colon (:)
+        response_key = "NSE_INDEX:India VIX" 
+        
+        vix_resp = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": request_key}, headers=auth_headers())
         
         if vix_resp.status_code == 200:
             vix_data = vix_resp.json().get("data", {})
-            if vix_key in vix_data:
-                vix_val = vix_data[vix_key].get("last_price", 0.0)
-            else:
-                print(f"⚠️ VIX API Warning: Key not found. Upstox returned: {vix_data}")
-        else:
-            print(f"⚠️ VIX API Error: {vix_resp.status_code} - {vix_resp.text}")
-    except Exception as e: 
-        print(f"⚠️ VIX Code Crash: {e}")
+            # Look for the colon version first, fallback to the pipe version just in case
+            if response_key in vix_data:
+                vix_val = vix_data[response_key].get("last_price", 0.0)
+            elif request_key in vix_data:
+                vix_val = vix_data[request_key].get("last_price", 0.0)
+    except: 
+        pass
 
     # 🟢 3. RETURN WITH NEW DATA
     return jsonify({
