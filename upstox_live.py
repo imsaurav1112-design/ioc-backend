@@ -496,6 +496,18 @@ def expiry_dates():
         expiries = sorted({item["expiry"] for item in data if item.get("expiry")})
         return jsonify({"symbol": symbol, "expiries": expiries})
 
+def calculate_max_pain(chain_rows):
+    if not chain_rows: return 0
+    strikes = [r['strike'] for r in chain_rows]
+    total_pain = []
+    for s in strikes:
+        pain = 0
+        for r in chain_rows:
+            if s > r['strike']: pain += (s - r['strike']) * r['ce'].get('oi', 0)
+            elif s < r['strike']: pain += (r['strike'] - s) * r['pe'].get('oi', 0)
+        total_pain.append(pain)
+    return strikes[total_pain.index(min(total_pain))] if total_pain else 0
+
 @app.route("/options-chain", methods=['GET', 'OPTIONS'], strict_slashes=False)
 @require_firebase_auth
 def options_chain():
@@ -542,11 +554,25 @@ def options_chain():
         total_pe_oi += pe["oi"]
         chain_rows.append({"strike": strike, "atm": atm is not None and abs(strike - atm) < cfg["step"], "ce": ce, "pe": pe})
 
-    chain_rows = inject_prz(chain_rows, expiry, cfg["step"], spot)
+chain_rows = inject_prz(chain_rows, expiry, cfg["step"], spot)
     coa_data = calculate_coa(chain_rows, symbol, expiry)
 
+    # 🟢 1. CALCULATE MAX PAIN
+    mp_val = calculate_max_pain(chain_rows)
+
+    # 🟢 2. FETCH INDIA VIX
+    vix_val = 0.0
+    try:
+        vix_resp = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": "NSE_INDEX|India VIX"}, headers=auth_headers())
+        if vix_resp.status_code == 200:
+            vix_val = vix_resp.json().get("data", {}).get("NSE_INDEX|India VIX", {}).get("last_price", 0.0)
+    except: pass
+
+    # 🟢 3. RETURN WITH NEW DATA
     return jsonify({
         "symbol": symbol, "expiry": expiry, "spot": spot, "pcr": round(total_pe_oi / max(total_ce_oi, 1), 2),
+        "vix": vix_val,          # <-- NEW
+        "max_pain": mp_val,      # <-- NEW
         "total_ce_oi": total_ce_oi, "total_pe_oi": total_pe_oi, "lot_size": cfg["lot"],
         "chain": chain_rows, "fetched_at": get_ist_now().strftime("%H:%M:%S"), "coa": coa_data
     })
@@ -1119,15 +1145,28 @@ def get_footprint():
         "data": footprint_candles 
     })
 
-@app.route("/api/ticker-tape", methods=['GET', 'OPTIONS'])
-def get_ticker_tape():
+@app.route("/api/ticker-prices", methods=['GET', 'OPTIONS'])
+def get_ticker_prices():
     if request.method == 'OPTIONS': 
         return jsonify({"status": "ok"}), 200
     
-    return jsonify({
-        "status": "success",
-        "data": live_ticker_prices
-    })
+    # Map ugly Upstox keys to beautiful Frontend names
+    key_map = {
+        "NSE_INDEX|Nifty 50": "NIFTY 50",
+        "NSE_EQ|INE002A01018": "RELIANCE",
+        "NSE_EQ|INE040A01034": "HDFCBANK",
+        "NSE_EQ|INE467B01029": "TCS",
+        "NSE_EQ|INE090A01021": "ICICIBANK",
+        "NSE_EQ|INE009A01021": "INFY"
+    }
+
+    friendly_prices = {}
+    for raw_key, price in live_ticker_prices.items():
+        if raw_key in key_map:
+            friendly_prices[key_map[raw_key]] = price
+
+    # Return exactly what the Javascript expects
+    return jsonify(friendly_prices)
     
 # ══════════════════════════════════════════════════════════
 #  🟢 USER PROFILE ROUTE
