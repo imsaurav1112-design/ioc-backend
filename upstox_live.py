@@ -779,11 +779,13 @@ def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
     
     compressed_chain = []
     for r in chain_rows:
+        # 🟢 FIX: Exactly 20 strikes below and 20 strikes above ATM
         if abs(r['strike'] - atm) <= (20 * step): 
             compressed_chain.append([
                 r['strike'], r['ce'].get('oi', 0), r['ce'].get('volume', 0), float(r['ce'].get('ltp', 0)),
                 r['pe'].get('oi', 0), r['pe'].get('volume', 0), float(r['pe'].get('ltp', 0))
             ])
+
 
     try:
         history_col.update_one(
@@ -795,25 +797,50 @@ def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
     except Exception as e:
         print(f"❌ MongoDB Record Error: {e}")
 
+# 🟢 1. TARGET INDICES ONLY
+TARGET_INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"]
+
+@app.route("/cron/record", methods=['GET'])
+def trigger_record():
+    now = get_ist_now()
+    if not ANALYTICS_TOKEN:
+        return jsonify({"status": "blocked", "reason": "no_analytics_token"}), 403
+    
+    is_weekday = now.weekday() < 5
+    is_market_open = (
+        (now.hour == 9 and now.minute >= 15) or 
+        (now.hour > 9 and now.hour < 15) or 
+        (now.hour == 15 and now.minute <= 30)
+    )
+
+    if is_weekday and is_market_open:
+        try:
+            # 🟢 FIX: Only record NIFTY, BANKNIFTY, and SENSEX
+            for sym in TARGET_INDICES:
+                fetch_and_record(sym)
+            return jsonify({"status": "success", "message": f"Recorded selected indices at {now.strftime('%H:%M:%S')} IST"})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+    
+    return jsonify({"status": "sleeping", "message": f"Market Closed"}), 200
+
 def fetch_and_record(symbol):
     cfg = SYMBOL_MAP.get(symbol)
     if not cfg: return
     
     try:
         if cfg.get("is_mcx"):
-            ensure_mcx_master()
-            base = cfg["base_name"]
-            valid_exps = []
-            for e, data in MCX_MASTER_DICT.get(base, {}).items():
-                if data['date'] >= get_ist_now().date():
-                    valid_exps.append(e)
-            if not valid_exps: return
-            valid_exps.sort(key=lambda x: MCX_MASTER_DICT[base][x]['date'])
-            exp = valid_exps[0]
-            raw, spot = fetch_custom_mcx_chain(base, exp, auth_headers())
+            return # Skipping MCX as per your requirements
         else:
+            # 🟢 2. GET CLOSEST EXPIRY ONLY
             r = requests.get(f"{BASE_URL}/option/contract", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
-            exp = r.json()["data"][0]["expiry"]
+            contracts = r.json().get("data", [])
+            if not contracts: return
+            
+            # Upstox returns contracts sorted by date. Index [0] is ALWAYS the closest/present expiry.
+            exp = contracts[0]["expiry"] 
+            
+            # Fetch Spot and Chain
             r = requests.get(f"{BASE_URL}/market-quote/ltp", params={"instrument_key": cfg["instrument_key"]}, headers=auth_headers())
             spot = list(r.json()["data"].values())[0]["last_price"]
             r = requests.get(f"{BASE_URL}/option/chain", params={"instrument_key": cfg["instrument_key"], "expiry_date": exp}, headers=auth_headers())
@@ -837,11 +864,12 @@ def fetch_and_record(symbol):
         
     except Exception as e: print(f"Record Error {symbol}: {e}")
 
+# 🟢 1. TARGET INDICES ONLY
+TARGET_INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"]
+
 @app.route("/cron/record", methods=['GET'])
 def trigger_record():
     now = get_ist_now()
-    
-    # ✅ Securely check the new Analytics Token
     if not ANALYTICS_TOKEN:
         return jsonify({"status": "blocked", "reason": "no_analytics_token"}), 403
     
@@ -854,14 +882,14 @@ def trigger_record():
 
     if is_weekday and is_market_open:
         try:
-            for sym in SYMBOL_MAP.keys():
+            # 🟢 FIX: Only record NIFTY, BANKNIFTY, and SENSEX
+            for sym in TARGET_INDICES:
                 fetch_and_record(sym)
-            return jsonify({"status": "success", "message": f"Recorded all indices at {now.strftime('%H:%M:%S')} IST"})
+            return jsonify({"status": "success", "message": f"Recorded selected indices at {now.strftime('%H:%M:%S')} IST"})
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
     
-    return jsonify({"status": "sleeping", "message": f"Market Closed (Server Time: {now.strftime('%H:%M:%S')} IST)"}), 200
-
+    return jsonify({"status": "sleeping", "message": f"Market Closed"}), 200
 
 from datetime import timedelta
 
