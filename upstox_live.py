@@ -257,19 +257,21 @@ rzp_client = razorpay.Client(auth=(RZP_KEY_ID, RZP_KEY_SECRET))
 def require_firebase_auth(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
+        # 🟢 FIX: Let Flask-CORS handle the complex headers. Just return 200 OK.
         if request.method == "OPTIONS":
-            response = jsonify({"status": "ok"})
-            response.headers.add("Access-Control-Allow-Origin", "*")
-            response.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization")
-            response.headers.add("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            return response, 200
+            return jsonify({"status": "ok"}), 200
+            
         header = request.headers.get("Authorization")
-        if not header or not header.startswith("Bearer "): return jsonify({"error": "Unauthorized Access"}), 401
+        if not header or not header.startswith("Bearer "): 
+            return jsonify({"error": "Unauthorized Access"}), 401
+            
         token = header.split(" ")[1]
         try:
             decoded_token = auth.verify_id_token(token)
             request.user = decoded_token
-        except Exception as e: return jsonify({"error": "Invalid or Expired Token", "details": str(e)}), 401
+        except Exception as e: 
+            return jsonify({"error": "Invalid or Expired Token", "details": str(e)}), 401
+            
         return f(*args, **kwargs)
     return decorated_function
 
