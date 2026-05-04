@@ -786,7 +786,6 @@ def compress_and_save(symbol, expiry, spot, pcr, chain_rows):
                 r['pe'].get('oi', 0), r['pe'].get('volume', 0), float(r['pe'].get('ltp', 0))
             ])
 
-
     try:
         history_col.update_one(
             {"sym": symbol, "exp": expiry, "date": date_str, "time_key": time_key},
@@ -863,6 +862,8 @@ def fetch_and_record(symbol):
         compress_and_save(symbol, exp, spot, pcr, chain_rows)
         
     except Exception as e: print(f"Record Error {symbol}: {e}")
+
+from datetime import timedelta
 
 # 🟢 1. TARGET INDICES ONLY
 TARGET_INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"]
