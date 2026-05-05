@@ -631,6 +631,7 @@ def options_chain():
     atm = round(float(spot) / cfg["step"]) * cfg["step"] if spot else None
     chain_rows, total_ce_oi, total_pe_oi = [], 0, 0
     
+# 1. This 'for' loop is indented 4 spaces from the left wall
     for item in raw_list:
         strike = int(float(item.get("strike_price", 0)))
         if atm and abs(strike - atm) > 3000: continue
@@ -646,14 +647,16 @@ def options_chain():
                 "volume": md.get("volume", 0)
             }
             
-# Corrected version:
-ce = parse_side(item.get("call_options"))
-pe = parse_side(item.get("put_options"))
-total_ce_oi += ce["oi"]
-total_pe_oi += pe["oi"]
-chain_rows.append({"strike": strike, "atm": atm is not None and abs(strike - atm) < cfg["step"], "ce": ce, "pe": pe})
+        # 2. These 5 lines are INSIDE the loop (8 spaces from the left wall)
+        ce = parse_side(item.get("call_options"))
+        pe = parse_side(item.get("put_options"))
+        total_ce_oi += ce["oi"]
+        total_pe_oi += pe["oi"]
+        chain_rows.append({"strike": strike, "atm": atm is not None and abs(strike - atm) < cfg["step"], "ce": ce, "pe": pe})
 
-   chain_rows = inject_prz(chain_rows, expiry, cfg["step"], spot)
+    # 3. These 2 lines are OUTSIDE the loop (Back to 4 spaces from the left wall)
+    # Notice the 'c' aligns perfectly under the 'f' in 'for'
+    chain_rows = inject_prz(chain_rows, expiry, cfg["step"], spot)
     coa_data = calculate_coa(chain_rows, symbol, expiry)
     
     # 🟢 1. CALCULATE MAX PAIN
