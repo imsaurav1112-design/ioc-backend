@@ -653,7 +653,7 @@ total_ce_oi += ce["oi"]
 total_pe_oi += pe["oi"]
 chain_rows.append({"strike": strike, "atm": atm is not None and abs(strike - atm) < cfg["step"], "ce": ce, "pe": pe})
 
-    chain_rows = inject_prz(chain_rows, expiry, cfg["step"], spot)
+   chain_rows = inject_prz(chain_rows, expiry, cfg["step"], spot)
     coa_data = calculate_coa(chain_rows, symbol, expiry)
     
     # 🟢 1. CALCULATE MAX PAIN
