@@ -1276,7 +1276,6 @@ live_ticker_prices = {}
 def start_footprint_streamer():
     global footprint_candles
     
-    # SECURITY FIX: Use the 1-Year Analytics Token, not the old access token
     if not ANALYTICS_TOKEN:
         print("🚨 ERROR: No Analytics Token found! Footprint engine cannot start.")
         return
@@ -1286,9 +1285,6 @@ def start_footprint_streamer():
         configuration.access_token = ANALYTICS_TOKEN
         api_client = upstox_client.ApiClient(configuration)
         
-        # ==========================================
-        # 🟢 LIVE TICKER TAPE SUBSCRIPTIONS
-        # ==========================================
         nifty_keys = [
             "NSE_INDEX|Nifty 50",       
             "NSE_EQ|INE002A01018",      
@@ -1307,29 +1303,26 @@ def start_footprint_streamer():
                     for incoming_key, feed in message["feeds"].items():
                         
                         if "ff" in feed:
-                           # 1. PROCESS EQUITIES (For the Ticker Tape)
+                            # 1. PROCESS EQUITIES (For the Ticker Tape)
                             if "marketFF" in feed["ff"]:
                                 market_data = feed["ff"]["marketFF"]
                                 ltpc = market_data.get("ltpc", {})
                                 
                                 ltp = float(ltpc.get("ltp", 0))
-                                cp = float(ltpc.get("cp", ltp)) # Grab previous close (fallback to ltp)
+                                cp = float(ltpc.get("cp", ltp)) 
                                 
-                                # Calculate the percentage change instantly
                                 pct_change = round(((ltp - cp) / cp) * 100, 2) if cp > 0 else 0.0
                                 
-                                # Store as an object instead of just a flat number
                                 live_ticker_prices[incoming_key] = {
                                     "ltp": ltp,
                                     "pct": pct_change
                                 }
                                 
-                           # 2. PROCESS NIFTY INDEX (For the Footprint Chart)
+                            # 2. PROCESS NIFTY INDEX (For the Footprint Chart)
                             elif "indexFF" in feed["ff"] and incoming_key == "NSE_INDEX|Nifty 50":
                                 index_data = feed["ff"]["indexFF"]
                                 ltp = float(index_data["ltpc"]["ltp"])
                                 
-                                # 🟢 FIX: Spot has no real volume/orderbook. We use Synthetic Momentum Volume.
                                 rounded_price = round(ltp)
                                 candle_key = get_current_candle_time()
                                 
@@ -1341,67 +1334,37 @@ def start_footprint_streamer():
                                         oldest_candle = sorted(list(footprint_candles.keys()))[0]
                                         del footprint_candles[oldest_candle]
 
-                                # Update OHLC
                                 footprint_candles[candle_key]["high"] = max(footprint_candles[candle_key]["high"], ltp)
                                 footprint_candles[candle_key]["low"] = min(footprint_candles[candle_key]["low"], ltp)
                                 footprint_candles[candle_key]["close"] = ltp
 
-                                # Initialize Volume Row
                                 current_matrix = footprint_candles[candle_key]["volumes"]
                                 if str(rounded_price) not in current_matrix:
                                     current_matrix[str(rounded_price)] = {"buy_vol": 0, "sell_vol": 0}
 
-                                # Synthetic Orderflow Logic (Calculates Buy/Sell pressure based on tick direction)
-                                prev_close = index_data["ltpc"].get("cp", ltp) # Fallback to ltp if cp missing
+                                prev_close = index_data["ltpc"].get("cp", ltp) 
                                 tick_diff = ltp - prev_close
-                                synthetic_vol = int(abs(tick_diff) * 150) + 25 # Generates 25 to ~300 volume per tick
+                                synthetic_vol = int(abs(tick_diff) * 150) + 25 
                                 
                                 if tick_diff >= 0:
                                     current_matrix[str(rounded_price)]["buy_vol"] += synthetic_vol
                                 else:
                                     current_matrix[str(rounded_price)]["sell_vol"] += synthetic_vol
                                 
-                              # -- FOOTPRINT LOGIC FOR NIFTY ONLY --
-if synthetic_vol > 0 and "marketLevel" in index_data:
-    bids_asks = index_data["marketLevel"].get("bidAskQuote", [])
-    if len(bids_asks) > 0:
-        top_bid = float(bids_asks[0]["bp"])
-        top_ask = float(bids_asks[0]["ap"])
-        rounded_price = round(ltp)
-        
-        candle_key = get_current_candle_time()
-        
-        # Initialize OHLC and volumes structure
-        if candle_key not in footprint_candles:
-            footprint_candles[candle_key] = {
-                "open": ltp, "high": ltp, "low": ltp, "close": ltp,
-                "volumes": {}
-            }
-            if len(footprint_candles) > 12:
-                oldest_candle = sorted(list(footprint_candles.keys()))[0]
-                del footprint_candles[oldest_candle]
-
-        # Update High, Low, and Close on every tick
-        footprint_candles[candle_key]["high"] = max(footprint_candles[candle_key]["high"], ltp)
-        footprint_candles[candle_key]["low"] = min(footprint_candles[candle_key]["low"], ltp)
-        footprint_candles[candle_key]["close"] = ltp
-
-        # Update Volume Matrix
-        current_matrix = footprint_candles[candle_key]["volumes"]
-        
-        if str(rounded_price) not in current_matrix:
-            current_matrix[str(rounded_price)] = {"buy_vol": 0, "sell_vol": 0}
-            
-        # FIX: Replaced 'volume' with 'synthetic_vol'
-        if ltp >= top_ask:
-            current_matrix[str(rounded_price)]["buy_vol"] += synthetic_vol
-        elif ltp <= top_bid:
-            current_matrix[str(rounded_price)]["sell_vol"] += synthetic_vol
-# 👇 ADD THIS MISSING PIECE BACK IN 👇
+                                # -- FOOTPRINT LOGIC FOR NIFTY ONLY --
+                                if synthetic_vol > 0 and "marketLevel" in index_data:
+                                    bids_asks = index_data["marketLevel"].get("bidAskQuote", [])
+                                    if len(bids_asks) > 0:
+                                        top_bid = float(bids_asks[0]["bp"])
+                                        top_ask = float(bids_asks[0]["ap"])
+                                        
+                                        if ltp >= top_ask:
+                                            current_matrix[str(rounded_price)]["buy_vol"] += synthetic_vol
+                                        elif ltp <= top_bid:
+                                            current_matrix[str(rounded_price)]["sell_vol"] += synthetic_vol 
             except Exception as e:
                 pass 
 
-        # The rest of your streamer connection code stays the same
         streamer.on("message", on_message)
         print(f"⚡ REAL Footprint & Ticker Streamer Connecting...")
         streamer.connect()
