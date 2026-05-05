@@ -1397,9 +1397,11 @@ if synthetic_vol > 0 and "marketLevel" in index_data:
             current_matrix[str(rounded_price)]["buy_vol"] += synthetic_vol
         elif ltp <= top_bid:
             current_matrix[str(rounded_price)]["sell_vol"] += synthetic_vol
-except Exception as e:
+# 👇 ADD THIS MISSING PIECE BACK IN 👇
+            except Exception as e:
                 pass 
 
+        # The rest of your streamer connection code stays the same
         streamer.on("message", on_message)
         print(f"⚡ REAL Footprint & Ticker Streamer Connecting...")
         streamer.connect()
